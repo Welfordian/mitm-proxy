@@ -1,0 +1,4 @@
+.idea
+ca-cert.pem
+ca-key.pem
+*.exe

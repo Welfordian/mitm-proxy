@@ -1,0 +1,26 @@
+{
+  "listen_addr": ":8080",
+  "proxy_name": "MITM-Proxy",
+  "ca_cert_path": null,
+  "ca_key_path": null,
+  "ca_cert_output_path": "ca-cert.pem",
+  "ca_key_output_path": "ca-key.pem",
+  "enable_mitm": true,
+  "excluded_domains": [],
+  "verbose_logging": true,
+  "log_requests": true,
+  "max_idle_conns": 200,
+  "idle_conn_timeout_seconds": 90,
+  "tls_handshake_timeout_seconds": 10,
+  "min_tls_version": "1.2",
+  "tls_next_protos": ["h2", "http/1.1"],
+  "cache": {
+    "enabled": true,
+    "directory": "/var/cache/mitm-proxy",
+    "include_domains": [],
+    "exclude_domains": [],
+    "include_extensions": ["jpg", "png", "webp", "css", "js"],
+    "exclude_extensions": [],
+    "ttl": 3600
+  }
+}
