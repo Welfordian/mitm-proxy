@@ -88,7 +88,7 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 			p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 		}
 
-		resp, err := p.client.Do(req)
+		resp, err := p.httpClient().Do(req)
 
 		if err != nil {
 			p.logVerbose("upstream HTTPS/2 error: %v", err)

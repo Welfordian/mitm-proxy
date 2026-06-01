@@ -789,6 +789,12 @@ textarea {
   margin: 12px 0 18px;
 }
 
+.stacked-label {
+  display: grid;
+  gap: 6px;
+  margin: 10px 0 18px;
+}
+
 .muted { color: var(--fg-2); }
 .error {
   color: var(--danger-fg);

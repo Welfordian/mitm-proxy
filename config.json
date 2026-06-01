@@ -106,5 +106,18 @@
     "timeout_ms": 60000,
     "max_body_bytes": 32768,
     "redact_before_ai": true
+  },
+  "upstream_proxy": {
+    "enabled": false,
+    "url": "",
+    "username": "",
+    "password_env": "UPSTREAM_PROXY_PASSWORD",
+    "no_proxy": [
+      "localhost",
+      "127.0.0.1",
+      "::1"
+    ],
+    "chain_tunnels": true,
+    "apply_to_repeater": true
   }
 }

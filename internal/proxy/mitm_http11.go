@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/upstream"
 )
 
 // mitmHTTPS11 handles HTTPS traffic where ALPN negotiated HTTP/1.1.
@@ -118,7 +119,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 			p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 		}
 
-		resp, err := p.client.Do(req)
+		resp, err := p.httpClient().Do(req)
 
 		if err != nil {
 			log.Printf("upstream HTTPS/1.1 error: %v", err)
@@ -196,7 +197,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 		targetHost = net.JoinHostPort(targetHost, "443")
 	}
 
-	rawUpstream, err := net.DialTimeout("tcp", targetHost, 10*time.Second)
+	rawUpstream, err := upstream.DialContext(req.Context(), p.cfg(), targetHost)
 
 	if err != nil {
 		log.Printf("wss upstream dial error: %v", err)

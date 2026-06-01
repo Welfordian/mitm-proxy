@@ -6,28 +6,25 @@ import (
 	"crypto/x509"
 	"encoding/hex"
 	"log"
-	"net"
 	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
 
-	"golang.org/x/net/http2"
-
 	capkg "mitm-proxy/internal/ca"
 	cachepkg "mitm-proxy/internal/cache"
 	cfgpkg "mitm-proxy/internal/config"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/threats"
+	"mitm-proxy/internal/upstream"
 )
 
 // Proxy is the core HTTP handler implementing MITM and tunneling.
 type Proxy struct {
 	ca     *capkg.CA
 	config atomic.Value
-
-	client *http.Client
+	client atomic.Value
 
 	mu        sync.Mutex
 	certCache map[string]*tls.Certificate
@@ -46,37 +43,23 @@ func NewWithEvents(ca *capkg.CA, config *cfgpkg.Config, eventBus *events.Bus) *P
 		eventBus = events.NewBus(128)
 	}
 
-	transport := &http.Transport{
-		Proxy:               nil,
-		ForceAttemptHTTP2:   true,
-		MaxIdleConns:        config.MaxIdleConns,
-		IdleConnTimeout:     time.Duration(config.IdleConnTimeout) * time.Second,
-		TLSHandshakeTimeout: time.Duration(config.TLSHandshakeTimeout) * time.Second,
-		DialContext:         (&net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-	}
-
-	if err := http2.ConfigureTransport(transport); err != nil {
-		log.Printf("warning: failed to configure HTTP/2 on transport: %v", err)
-	}
-
 	p := &Proxy{
 		ca:        ca,
-		client:    &http.Client{Transport: transport},
 		certCache: make(map[string]*tls.Certificate),
 		cache:     cachepkg.New(config),
 		events:    eventBus,
 	}
 	p.config.Store(config)
+	p.client.Store(upstream.NewHTTPClient(config, 0))
 	p.threats = threats.NewManager(p.cfg)
 	return p
 }
 
 // SetConfig updates the proxy's runtime configuration safely.
-// Note: Transport settings such as timeouts are not rebuilt here to keep changes minimal.
-// For settings used in hot paths (logging, cache, TLS min version), the new config will take effect immediately.
 func (p *Proxy) SetConfig(cfg *cfgpkg.Config) {
 	// Atomic swap avoids data races with concurrent reads
 	p.config.Store(cfg)
+	p.client.Store(upstream.NewHTTPClient(cfg, 0))
 	if p.cache != nil {
 		p.cache.SetConfig(cfg)
 	}
@@ -98,6 +81,13 @@ func (p *Proxy) cfg() *cfgpkg.Config {
 
 func (p *Proxy) CurrentConfig() *cfgpkg.Config {
 	return p.cfg()
+}
+
+func (p *Proxy) httpClient() *http.Client {
+	if v := p.client.Load(); v != nil {
+		return v.(*http.Client)
+	}
+	return upstream.NewHTTPClient(p.cfg(), 0)
 }
 
 func (p *Proxy) ThreatScanner() *threats.Manager {

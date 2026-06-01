@@ -122,6 +122,55 @@ func TestLegacyTrafficReplayStillWorks(t *testing.T) {
 	}
 }
 
+func TestRepeaterSendUsesConfiguredUpstreamProxy(t *testing.T) {
+	st := openAdminTestStore(t)
+	var proxyHits atomic.Int64
+	upstreamProxy := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		proxyHits.Add(1)
+		if r.URL.Scheme != "http" || r.URL.Host != "target.test" {
+			t.Fatalf("expected repeater request to use upstream absolute-form URL, got %q", r.URL.String())
+		}
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte("via-upstream"))
+	}))
+	defer upstreamProxy.Close()
+
+	cfg := &cfgpkg.Config{
+		UpstreamProxy: cfgpkg.UpstreamProxyConfig{
+			Enabled:         true,
+			URL:             upstreamProxy.URL,
+			PasswordEnv:     "UPSTREAM_PROXY_PASSWORD",
+			NoProxy:         []string{},
+			ApplyToRepeater: true,
+			ChainTunnels:    true,
+		},
+	}
+	s := New(Options{
+		Token:     "admin-token",
+		ReadToken: "read-token",
+		Store:     st,
+		Config:    func() *cfgpkg.Config { return cfg },
+	})
+	data := postJSONForTest(t, s, "/api/repeater/cases", map[string]any{
+		"method":     "GET",
+		"url":        "http://target.test/path",
+		"headers":    map[string][]string{},
+		"timeout_ms": 30000,
+	})
+	var c store.RepeaterCase
+	if err := json.Unmarshal(data, &c); err != nil {
+		t.Fatalf("decode case: %v", err)
+	}
+	runData := postForTest(t, s, "/api/repeater/cases/"+c.ID+"/send", "admin-token")
+	var run store.RepeaterRun
+	if err := json.Unmarshal(runData, &run); err != nil {
+		t.Fatalf("decode run: %v", err)
+	}
+	if run.Status != http.StatusAccepted || run.ResponseBody != "via-upstream" || proxyHits.Load() != 1 {
+		t.Fatalf("expected repeater through upstream proxy, run=%+v hits=%d", run, proxyHits.Load())
+	}
+}
+
 func TestTrafficListSupportsLimitAndOffset(t *testing.T) {
 	st := openAdminTestStore(t)
 	ctx := context.Background()

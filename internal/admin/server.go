@@ -31,6 +31,7 @@ import (
 	"mitm-proxy/internal/policy"
 	"mitm-proxy/internal/store"
 	"mitm-proxy/internal/threats"
+	"mitm-proxy/internal/upstream"
 )
 
 type Options struct {
@@ -48,6 +49,7 @@ type Options struct {
 	CopilotClient copilot.Client
 	EventBus      *events.Bus
 	SaveConfig    func(context.Context, *cfgpkg.Config) error
+	ApplyConfig   func(*cfgpkg.Config)
 	ReloadConfig  func(context.Context) error
 	Restart       func(context.Context) error
 	RotateCA      func(context.Context) error
@@ -514,7 +516,7 @@ func (s *Server) handleTrafficReplay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	run := sendRepeaterCase(r.Context(), c)
+	run := s.sendRepeaterCase(r.Context(), c)
 	if run.Error != "" {
 		http.Error(w, run.Error, http.StatusBadGateway)
 		return
@@ -655,7 +657,7 @@ func (s *Server) handleRepeaterSend(w http.ResponseWriter, r *http.Request, id s
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	run := sendRepeaterCase(r.Context(), c)
+	run := s.sendRepeaterCase(r.Context(), c)
 	stored, err := s.options.Store.AddRepeaterRun(r.Context(), run)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -1142,7 +1144,7 @@ func validateRepeaterCase(c store.RepeaterCase) error {
 	return nil
 }
 
-func sendRepeaterCase(ctx context.Context, c store.RepeaterCase) store.RepeaterRun {
+func (s *Server) sendRepeaterCase(ctx context.Context, c store.RepeaterCase) store.RepeaterRun {
 	run := store.RepeaterRun{
 		CaseID:          c.ID,
 		CreatedAt:       time.Now().UTC(),
@@ -1155,6 +1157,12 @@ func sendRepeaterCase(ctx context.Context, c store.RepeaterCase) store.RepeaterR
 		return run
 	}
 	client := &http.Client{Timeout: time.Duration(c.TimeoutMS) * time.Millisecond}
+	if s.options.Config != nil {
+		cfg := s.options.Config()
+		if cfg != nil && cfg.UpstreamProxy.Enabled && cfg.UpstreamProxy.ApplyToRepeater {
+			client = upstream.NewHTTPClient(cfg, time.Duration(c.TimeoutMS)*time.Millisecond)
+		}
+	}
 	resp, err := client.Do(req)
 	run.DurationMS = time.Since(start).Milliseconds()
 	if err != nil {
@@ -1787,7 +1795,7 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
-	cfg := s.options.Config()
+	cfg := cloneConfig(s.options.Config())
 	if r.Method == http.MethodPut {
 		var input struct {
 			EnableMITM      *bool    `json:"enable_mitm"`
@@ -1810,6 +1818,16 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				RedactBeforeAI  *bool  `json:"redact_before_ai"`
 				OpenAIAPIKeyEnv string `json:"openai_api_key_env"`
 			} `json:"ai_copilot"`
+			UpstreamProxy *struct {
+				Enabled         *bool    `json:"enabled"`
+				URL             string   `json:"url"`
+				Username        string   `json:"username"`
+				HasUsername     bool     `json:"has_username"`
+				PasswordEnv     string   `json:"password_env"`
+				NoProxy         []string `json:"no_proxy"`
+				ChainTunnels    *bool    `json:"chain_tunnels"`
+				ApplyToRepeater *bool    `json:"apply_to_repeater"`
+			} `json:"upstream_proxy"`
 			Cache *struct {
 				Enabled           *bool    `json:"enabled"`
 				Directory         string   `json:"directory"`
@@ -1876,6 +1894,27 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				cfg.AICopilot.OpenAIAPIKeyEnv = input.AICopilot.OpenAIAPIKeyEnv
 			}
 		}
+		if input.UpstreamProxy != nil {
+			if input.UpstreamProxy.Enabled != nil {
+				cfg.UpstreamProxy.Enabled = *input.UpstreamProxy.Enabled
+			}
+			cfg.UpstreamProxy.URL = input.UpstreamProxy.URL
+			if input.UpstreamProxy.Username != "" || !input.UpstreamProxy.HasUsername {
+				cfg.UpstreamProxy.Username = input.UpstreamProxy.Username
+			}
+			if input.UpstreamProxy.PasswordEnv != "" {
+				cfg.UpstreamProxy.PasswordEnv = input.UpstreamProxy.PasswordEnv
+			}
+			if input.UpstreamProxy.NoProxy != nil {
+				cfg.UpstreamProxy.NoProxy = input.UpstreamProxy.NoProxy
+			}
+			if input.UpstreamProxy.ChainTunnels != nil {
+				cfg.UpstreamProxy.ChainTunnels = *input.UpstreamProxy.ChainTunnels
+			}
+			if input.UpstreamProxy.ApplyToRepeater != nil {
+				cfg.UpstreamProxy.ApplyToRepeater = *input.UpstreamProxy.ApplyToRepeater
+			}
+		}
 		if input.Cache != nil {
 			if input.Cache.Enabled != nil {
 				cfg.Cache.Enabled = *input.Cache.Enabled
@@ -1899,6 +1938,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				cfg.Cache.TTL = *input.Cache.TTL
 			}
 		}
+		if err := cfg.ValidateUpstreamProxy(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
 		if s.options.Store != nil {
 			_ = s.options.Store.SetSetting(r.Context(), "runtime_config", safeSettings(cfg))
 		}
@@ -1908,6 +1951,9 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			s.audit(r, "settings.persist", map[string]any{"config_path": s.options.ConfigPath})
+		}
+		if s.options.ApplyConfig != nil {
+			s.options.ApplyConfig(cfg)
 		}
 		if s.options.PublishEvent != nil {
 			s.options.PublishEvent(events.Event{
@@ -2059,6 +2105,46 @@ func safeSettings(cfg *cfgpkg.Config) map[string]any {
 		"cache":                cfg.Cache,
 		"traffic_capture":      cfg.TrafficCapture,
 		"ai_copilot":           cfg.AICopilot,
+		"upstream_proxy":       safeUpstreamProxySettings(cfg.UpstreamProxy),
+	}
+}
+
+func cloneConfig(cfg *cfgpkg.Config) *cfgpkg.Config {
+	if cfg == nil {
+		return &cfgpkg.Config{}
+	}
+	data, err := json.Marshal(cfg)
+	if err != nil {
+		cloned := *cfg
+		return &cloned
+	}
+	var cloned cfgpkg.Config
+	if err := json.Unmarshal(data, &cloned); err != nil {
+		shallow := *cfg
+		return &shallow
+	}
+	return &cloned
+}
+
+func safeUpstreamProxySettings(c cfgpkg.UpstreamProxyConfig) map[string]any {
+	parsed, _ := url.Parse(c.URL)
+	scheme := ""
+	host := ""
+	if parsed != nil {
+		scheme = parsed.Scheme
+		host = parsed.Host
+	}
+	return map[string]any{
+		"enabled":           c.Enabled,
+		"url":               c.URL,
+		"scheme":            scheme,
+		"host":              host,
+		"username":          "",
+		"password_env":      c.PasswordEnv,
+		"no_proxy":          c.NoProxy,
+		"chain_tunnels":     c.ChainTunnels,
+		"apply_to_repeater": c.ApplyToRepeater,
+		"has_username":      strings.TrimSpace(c.Username) != "",
 	}
 }
 

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"strings"
 )
@@ -68,6 +69,9 @@ type Config struct {
 
 	// AI copilot powers optional research assistance in the admin dashboard.
 	AICopilot AICopilotConfig `json:"ai_copilot"`
+
+	// Upstream proxy chains outbound traffic through another HTTP(S) proxy.
+	UpstreamProxy UpstreamProxyConfig `json:"upstream_proxy"`
 
 	// Traffic capture controls body persistence for dashboard inspection.
 	TrafficCapture TrafficCaptureConfig `json:"traffic_capture"`
@@ -134,6 +138,16 @@ type AICopilotConfig struct {
 	OpenAIAPIKeyEnv string `json:"openai_api_key_env"`
 }
 
+type UpstreamProxyConfig struct {
+	Enabled         bool     `json:"enabled"`
+	URL             string   `json:"url"`
+	Username        string   `json:"username"`
+	PasswordEnv     string   `json:"password_env"`
+	NoProxy         []string `json:"no_proxy"`
+	ChainTunnels    bool     `json:"chain_tunnels"`
+	ApplyToRepeater bool     `json:"apply_to_repeater"`
+}
+
 type TrafficCaptureConfig struct {
 	StoreBodies  bool  `json:"store_bodies"`
 	MaxBodyBytes int64 `json:"max_body_bytes"`
@@ -172,11 +186,24 @@ func defaultConfig() *Config {
 		},
 		ThreatScanner: defaultThreatScannerConfig(),
 		AICopilot:     defaultAICopilotConfig(),
+		UpstreamProxy: defaultUpstreamProxyConfig(),
 		TrafficCapture: TrafficCaptureConfig{
 			StoreBodies:  false,
 			MaxBodyBytes: 32768,
 			RedactBodies: true,
 		},
+	}
+}
+
+func defaultUpstreamProxyConfig() UpstreamProxyConfig {
+	return UpstreamProxyConfig{
+		Enabled:         false,
+		URL:             "",
+		Username:        "",
+		PasswordEnv:     "UPSTREAM_PROXY_PASSWORD",
+		NoProxy:         []string{"localhost", "127.0.0.1", "::1"},
+		ChainTunnels:    true,
+		ApplyToRepeater: true,
 	}
 }
 
@@ -280,6 +307,7 @@ func Load(path string) (*Config, error) {
 
 	applyThreatScannerDefaults(&cfg.ThreatScanner)
 	applyAICopilotDefaults(&cfg.AICopilot, cfg.ThreatScanner)
+	applyUpstreamProxyDefaults(&cfg.UpstreamProxy)
 	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
 
 	if strings.TrimSpace(cfg.AdminAddr) == "" {
@@ -312,9 +340,23 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("invalid config: cache.include_extensions and cache.exclude_extensions cannot both be set")
 	}
 
+	if err := cfg.ValidateUpstreamProxy(); err != nil {
+		return nil, err
+	}
+
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+func applyUpstreamProxyDefaults(c *UpstreamProxyConfig) {
+	defaults := defaultUpstreamProxyConfig()
+	if c.PasswordEnv == "" {
+		c.PasswordEnv = defaults.PasswordEnv
+	}
+	if c.NoProxy == nil {
+		c.NoProxy = defaults.NoProxy
+	}
 }
 
 func applyAICopilotDefaults(c *AICopilotConfig, scanner ThreatScannerConfig) {
@@ -338,6 +380,62 @@ func applyAICopilotDefaults(c *AICopilotConfig, scanner ThreatScannerConfig) {
 	if c.OpenAIAPIKeyEnv == "" {
 		c.OpenAIAPIKeyEnv = defaults.OpenAIAPIKeyEnv
 	}
+}
+
+func (c *Config) ValidateUpstreamProxy() error {
+	upstream := c.UpstreamProxy
+	for _, pattern := range upstream.NoProxy {
+		if err := validateHostPattern(pattern); err != nil {
+			return fmt.Errorf("invalid config: upstream_proxy.no_proxy contains %q: %w", pattern, err)
+		}
+	}
+	if !upstream.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(upstream.URL) == "" {
+		return fmt.Errorf("invalid config: upstream_proxy.url is required when upstream proxy is enabled")
+	}
+	parsed, err := url.Parse(strings.TrimSpace(upstream.URL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("invalid config: upstream_proxy.url must be an absolute http or https URL")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("invalid config: upstream_proxy.url must use http or https")
+	}
+	if parsed.User != nil {
+		return fmt.Errorf("invalid config: upstream_proxy.url must not include credentials; use upstream_proxy.username and upstream_proxy.password_env")
+	}
+	return nil
+}
+
+func validateHostPattern(pattern string) error {
+	pattern = strings.TrimSpace(pattern)
+	if pattern == "" {
+		return fmt.Errorf("empty pattern")
+	}
+	if strings.Contains(pattern, "://") || strings.ContainsAny(pattern, "/\\") {
+		return fmt.Errorf("must be a host or wildcard host")
+	}
+	host := pattern
+	if strings.HasPrefix(host, "*.") {
+		host = strings.TrimPrefix(host, "*.")
+		if host == "" {
+			return fmt.Errorf("wildcard host is missing suffix")
+		}
+	}
+	if strings.Contains(host, ":") {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		} else if strings.Count(host, ":") > 1 {
+			host = strings.Trim(host, "[]")
+		} else {
+			return fmt.Errorf("host patterns must not include bare ports")
+		}
+	}
+	if strings.TrimSpace(host) == "" || strings.ContainsAny(host, " \t\r\n") {
+		return fmt.Errorf("invalid host")
+	}
+	return nil
 }
 
 func applyTrafficCaptureDefaults(c *TrafficCaptureConfig) {
@@ -481,4 +579,48 @@ func (c *Config) IsDomainExcluded(domain string) bool {
 	}
 
 	return false
+}
+
+func (c *Config) IsUpstreamProxyBypassed(host string) bool {
+	return matchHostPatterns(host, c.UpstreamProxy.NoProxy)
+}
+
+func matchHostPatterns(host string, patterns []string) bool {
+	if len(patterns) == 0 {
+		return false
+	}
+	host = normalizeHostForPattern(host)
+	if host == "" {
+		return false
+	}
+	for _, pattern := range patterns {
+		pattern = normalizeHostForPattern(pattern)
+		if strings.HasPrefix(pattern, "*.") {
+			suffix := pattern[1:]
+			if strings.HasSuffix(host, suffix) || host == strings.TrimPrefix(pattern, "*.") {
+				return true
+			}
+			continue
+		}
+		if pattern == host {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeHostForPattern(host string) string {
+	host = strings.ToLower(strings.TrimSpace(host))
+	if strings.HasPrefix(host, "[") && strings.Contains(host, "]") {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			return strings.Trim(h, "[]")
+		}
+		return strings.Trim(host, "[]")
+	}
+	if strings.Contains(host, ":") {
+		if h, _, err := net.SplitHostPort(host); err == nil {
+			host = h
+		}
+	}
+	return strings.Trim(host, ".")
 }

@@ -206,6 +206,7 @@ func main() {
 				})
 				return nil
 			},
+			ApplyConfig: proxy.SetConfig,
 			ReloadConfig: func(ctx context.Context) error {
 				path := cfgPathForDisplay(*configPath)
 				if path == "" {

@@ -221,6 +221,26 @@ npm install
 npm run build
 ```
 
+### Upstream Proxy Chaining
+
+Outbound traffic can be chained through an upstream HTTP or HTTPS proxy, such as Burp, ZAP, or a corporate egress proxy. When enabled, normal HTTP(S) forwarding, CONNECT pass-through tunnels, WebSockets, and Repeater sends use the upstream proxy unless a host matches `no_proxy`.
+
+```json
+{
+  "upstream_proxy": {
+    "enabled": true,
+    "url": "http://127.0.0.1:8080",
+    "username": "",
+    "password_env": "UPSTREAM_PROXY_PASSWORD",
+    "no_proxy": ["localhost", "127.0.0.1", "*.internal"],
+    "chain_tunnels": true,
+    "apply_to_repeater": true
+  }
+}
+```
+
+Only `http://` and `https://` upstream proxy URLs are supported in v1. If Basic auth is needed, set `username` and provide the password through the named environment variable; credentials embedded in the URL are rejected and are never shown in dashboard settings. If the upstream proxy is enabled but unavailable, affected requests fail visibly instead of silently falling back to direct connections.
+
 ### Research Repeater
 
 The dashboard's **Repeater** view lets security researchers clone captured HTTP traffic into saved editable cases. A case stores the method, URL, headers, body sample, timeout, and optional source traffic flow ID. Each send stores a run with status, duration, response headers, a capped response body sample, and any upstream error.

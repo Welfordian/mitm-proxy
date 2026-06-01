@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/upstream"
 )
 
 // isWebSocketRequest reports whether the request is a WS upgrade.
@@ -130,7 +131,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 	}
 
-	resp, err := p.client.Do(req)
+	resp, err := p.httpClient().Do(req)
 
 	if err != nil {
 		log.Printf("HTTP proxy error: %v", err)
@@ -221,7 +222,7 @@ func (p *Proxy) handleWebSocketHTTP(w http.ResponseWriter, r *http.Request) {
 		targetHost = net.JoinHostPort(targetHost, "80")
 	}
 
-	upstreamConn, err := net.DialTimeout("tcp", targetHost, 10*time.Second)
+	upstreamConn, err := upstream.DialContext(r.Context(), p.cfg(), targetHost)
 
 	if err != nil {
 		log.Printf("websocket upstream dial error: %v", err)

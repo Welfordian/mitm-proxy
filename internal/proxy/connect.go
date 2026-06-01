@@ -1,20 +1,21 @@
 package proxy
 
 import (
+	"context"
 	"crypto/tls"
 	"io"
 	"log"
 	"net"
 	"net/http"
 	"strings"
-	"time"
 
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/upstream"
 )
 
 // tunnelTCP relays raw bytes between client and target.
-func tunnelTCP(clientConn net.Conn, target string, p *Proxy) {
-	upstream, err := net.DialTimeout("tcp", target, 10*time.Second)
+func tunnelTCP(ctx context.Context, clientConn net.Conn, target string, p *Proxy) {
+	upstream, err := upstream.DialContext(ctx, p.cfg(), target)
 
 	if err != nil {
 		log.Printf("CONNECT tunnel dial error to %s: %v", target, err)
@@ -98,14 +99,14 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.logVerbose("Domain %s is excluded, using plain tunnel", host)
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
 
-		go tunnelTCP(clientConn, hostPort, p)
+		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
 		return
 	}
 
 	if port != "443" {
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
-		go tunnelTCP(clientConn, hostPort, p)
+		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
 		return
 	}
@@ -114,7 +115,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		p.logVerbose("MITM disabled, using plain tunnel for %s", hostPort)
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
 
-		go tunnelTCP(clientConn, hostPort, p)
+		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
 		return
 	}

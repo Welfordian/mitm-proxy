@@ -1226,13 +1226,16 @@ function PatternEditor({ title, placeholder, values, onChange }) {
 function SettingsView({ refreshKey, refresh }) {
   const state = useAsync(() => api("/api/settings"), [refreshKey]);
   const [form, setForm] = useState(null);
+  const [saveError, setSaveError] = useState("");
   useEffect(() => { if (state.data) setForm(state.data); }, [state.data]);
   if (state.loading || state.error || !form) return <PageState state={state} />;
   const capture = form.traffic_capture || {};
   const aiCopilot = form.ai_copilot || {};
+  const upstreamProxy = form.upstream_proxy || {};
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
   const setCapture = (patch) => set({ traffic_capture: { ...capture, ...patch } });
   const setAICopilot = (patch) => set({ ai_copilot: { ...aiCopilot, ...patch } });
+  const setUpstreamProxy = (patch) => set({ upstream_proxy: { ...upstreamProxy, ...patch } });
   const danger = async (action, message) => {
     if (!confirm(message)) return;
     await postJSON("/api/settings/danger", { action, confirm: true });
@@ -1244,8 +1247,9 @@ function SettingsView({ refreshKey, refresh }) {
       <div className="panel">
         <div className="detail-topbar">
           <h2>Settings</h2>
-          <button className="primary" onClick={async () => { await putJSON("/api/settings", form); refresh(); }}><Save />Save</button>
+          <button className="primary" onClick={async () => { setSaveError(""); try { await putJSON("/api/settings", form); refresh(); } catch (err) { setSaveError(err.message); } }}><Save />Save</button>
         </div>
+        {saveError && <p className="error-text">{saveError}</p>}
         <h3>Runtime</h3>
         <div className="settings-grid">
           <label><input type="checkbox" checked={!!form.enable_mitm} onChange={(e) => set({ enable_mitm: e.target.checked })} /> Enable MITM</label>
@@ -1271,6 +1275,17 @@ function SettingsView({ refreshKey, refresh }) {
           <label><input type="checkbox" checked={aiCopilot.redact_before_ai !== false} onChange={(e) => setAICopilot({ redact_before_ai: e.target.checked })} /> Redact before AI</label>
         </div>
         <p className="muted">API keys are read from the proxy process environment and are never stored in dashboard settings.</p>
+        <h3>Upstream Proxy</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!upstreamProxy.enabled} onChange={(e) => setUpstreamProxy({ enabled: e.target.checked })} /> Enable upstream chaining</label>
+          <label>Proxy URL<input value={upstreamProxy.url || ""} placeholder="http://127.0.0.1:8080" onChange={(e) => setUpstreamProxy({ url: e.target.value })} /></label>
+          <label>Username<input value={upstreamProxy.username || ""} placeholder={upstreamProxy.has_username ? "configured; enter a new username to replace" : "optional Basic auth username"} onChange={(e) => setUpstreamProxy({ username: e.target.value })} /></label>
+          <label>Password env var<input value={upstreamProxy.password_env || "UPSTREAM_PROXY_PASSWORD"} onChange={(e) => setUpstreamProxy({ password_env: e.target.value })} /></label>
+          <label><input type="checkbox" checked={upstreamProxy.chain_tunnels !== false} onChange={(e) => setUpstreamProxy({ chain_tunnels: e.target.checked })} /> Chain CONNECT and WebSocket tunnels</label>
+          <label><input type="checkbox" checked={upstreamProxy.apply_to_repeater !== false} onChange={(e) => setUpstreamProxy({ apply_to_repeater: e.target.checked })} /> Apply to Repeater sends</label>
+        </div>
+        <label className="stacked-label">Bypass hosts<textarea placeholder={"localhost\n127.0.0.1\n*.internal"} value={(upstreamProxy.no_proxy || []).join("\n")} onChange={(e) => setUpstreamProxy({ no_proxy: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} /></label>
+        <p className="muted">HTTP and HTTPS upstream proxies are supported. Passwords are read from the proxy process environment and are never stored in dashboard settings.</p>
         <h3>Excluded Domains</h3>
         <textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} />
         <CodeCard title="Cache" value={form.cache || {}} />
