@@ -18,7 +18,7 @@
 
 ![MITM Proxy Admin traffic workbench](docs/assets/admin-traffic.png)
 
-![MITM Proxy Admin repeater workbench](docs/assets/admin-repeater.png)
+![MITM Proxy Admin repeater workbench](docs/assets/admin-repeater-empty.png)
 
 
 
