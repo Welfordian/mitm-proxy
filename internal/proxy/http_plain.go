@@ -87,7 +87,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	verdict, scanErr := p.scanRequest(r.Context(), req)
+	verdict, scanErr := p.scanRequest(req.Context(), req)
 	if p.shouldBlock(verdict, scanErr) {
 		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 		return
@@ -96,10 +96,10 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Try cache for GET
 	if p.cache != nil && p.cache.ShouldConsider(req) {
-		if cr, hashHex, err := p.cache.Load(req.URL); err == nil && cr != nil {
+		if cr, hashHex, err := p.cache.LoadContext(req.Context(), req.URL); err == nil && cr != nil {
 			p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
 			cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone(), Body: io.NopCloser(strings.NewReader(""))}
-			verdict, scanErr := p.scanBufferedResponse(r.Context(), req, cachedResp, cr.Body)
+			verdict, scanErr := p.scanBufferedResponse(req.Context(), req, cachedResp, cr.Body)
 			if p.shouldBlock(verdict, scanErr) {
 				writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 				return
@@ -148,7 +148,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.cache != nil && p.cache.ShouldConsider(req) {
 		// read fully to cache
 		bodyBuf, _ = io.ReadAll(resp.Body)
-		verdict, scanErr := p.scanBufferedResponse(r.Context(), req, resp, bodyBuf)
+		verdict, scanErr := p.scanBufferedResponse(req.Context(), req, resp, bodyBuf)
 		if p.shouldBlock(verdict, scanErr) {
 			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 			return
@@ -162,7 +162,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 		w.WriteHeader(resp.StatusCode)
 		n, _ := w.Write(bodyBuf)
-		p.cache.Save(req.URL, resp, bodyBuf)
+		p.cache.SaveContext(req.Context(), req.URL, resp, bodyBuf)
 		dur := time.Since(start)
 
 		p.logRequest("HTTP %s %s -> status=%d, bytes=%d, dur=%s (cached)", r.Method, req.URL.String(), resp.StatusCode, n, dur)
@@ -172,7 +172,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// stream if not caching
-	verdict, scanErr = p.prepareResponseForScan(r.Context(), req, resp)
+	verdict, scanErr = p.prepareResponseForScan(req.Context(), req, resp)
 	if p.shouldBlock(verdict, scanErr) {
 		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 		return

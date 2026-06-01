@@ -81,7 +81,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 
 		// Try cache for GET
 		if p.cache != nil && p.cache.ShouldConsider(req) {
-			if cr, hashHex, err := p.cache.Load(req.URL); err == nil && cr != nil {
+			if cr, hashHex, err := p.cache.LoadContext(req.Context(), req.URL); err == nil && cr != nil {
 				p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
 				cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone()}
 				verdict, scanErr := p.scanBufferedResponse(req.Context(), req, cachedResp, cr.Body)
@@ -150,7 +150,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 				return
 			}
 
-			p.cache.Save(req.URL, resp, body)
+			p.cache.SaveContext(req.Context(), req.URL, resp, body)
 
 			p.logRequest("HTTPS/1.1 %s %s -> status=%d, dur=%s (cached)", req.Method, req.URL.String(), resp.StatusCode, time.Since(start))
 			p.publishTrafficCompleted(requestID, req, resp.StatusCode, len(body), time.Since(start), false, resp.Header)

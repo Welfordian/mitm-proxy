@@ -1,6 +1,7 @@
 package cache
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,8 +19,34 @@ import (
 
 // Cache encapsulates simple on-disk cache logic.
 type Cache struct {
-	mu  sync.RWMutex
-	cfg *cfgpkg.Config
+	mu    sync.RWMutex
+	cfg   *cfgpkg.Config
+	store BackingStore
+}
+
+type BackingStore interface {
+	LoadCacheEntry(ctx context.Context, key string) (StoredEntry, error)
+	SaveCacheEntry(ctx context.Context, entry StoredEntry) error
+}
+
+type StoredEntry struct {
+	Key         string      `json:"key"`
+	URL         string      `json:"url"`
+	Host        string      `json:"host,omitempty"`
+	Status      int         `json:"status"`
+	Headers     http.Header `json:"headers,omitempty"`
+	Body        []byte      `json:"-"`
+	StoredAt    time.Time   `json:"stored_at"`
+	ExpiresAt   time.Time   `json:"expires_at"`
+	Size        int64       `json:"size"`
+	ContentType string      `json:"content_type,omitempty"`
+	ViewURL     string      `json:"view_url,omitempty"`
+}
+
+type EntryPage struct {
+	Items   []StoredEntry
+	Total   int
+	HasMore bool
 }
 
 // Response is the cached payload stored on disk.
@@ -38,6 +65,18 @@ func New(cfg *cfgpkg.Config) *Cache {
 	c.ensureDir()
 
 	return c
+}
+
+func NewWithStore(cfg *cfgpkg.Config, store BackingStore) *Cache {
+	c := New(cfg)
+	c.SetStore(store)
+	return c
+}
+
+func (c *Cache) SetStore(store BackingStore) {
+	c.mu.Lock()
+	c.store = store
+	c.mu.Unlock()
 }
 
 // SetConfig updates the cache configuration reference and ensures directory when needed.
@@ -163,6 +202,30 @@ func (c *Cache) path(u *url.URL) (string, string) {
 
 // Load attempts to load a cached response for the given URL. Returns the cached Response and the cache key.
 func (c *Cache) Load(u *url.URL) (*Response, string, error) {
+	return c.LoadContext(context.Background(), u)
+}
+
+func (c *Cache) LoadContext(ctx context.Context, u *url.URL) (*Response, string, error) {
+	key := keyFromURL(u)
+	c.mu.RLock()
+	store := c.store
+	c.mu.RUnlock()
+
+	if store != nil {
+		entry, err := store.LoadCacheEntry(ctx, key)
+		if err != nil {
+			return nil, "", err
+		}
+		return &Response{
+			URL:       entry.URL,
+			Status:    entry.Status,
+			Header:    entry.Headers.Clone(),
+			Body:      entry.Body,
+			StoredAt:  entry.StoredAt.Unix(),
+			ExpiresAt: entry.ExpiresAt.Unix(),
+		}, key, nil
+	}
+
 	path, key := c.path(u)
 	b, err := os.ReadFile(path)
 
@@ -181,19 +244,63 @@ func (c *Cache) Load(u *url.URL) (*Response, string, error) {
 		return nil, "", os.ErrNotExist
 	}
 
+	if cr.Status == http.StatusNotModified && len(cr.Body) == 0 {
+		_ = os.Remove(path)
+		return nil, "", os.ErrNotExist
+	}
+
 	return &cr, key, nil
 }
 
 // Save stores the given response body for the URL with TTL.
 func (c *Cache) Save(u *url.URL, resp *http.Response, body []byte) {
+	c.SaveContext(context.Background(), u, resp, body)
+}
+
+func (c *Cache) SaveContext(ctx context.Context, u *url.URL, resp *http.Response, body []byte) {
 	c.mu.RLock()
 
 	ttl := c.cfg.Cache.TTL
 	verbose := c.cfg.VerboseLogging
+	store := c.store
 
 	c.mu.RUnlock()
 
 	if ttl <= 0 {
+		return
+	}
+
+	if resp.StatusCode == http.StatusNotModified {
+		if verbose {
+			log.Printf("[VERBOSE] skipping cache save for 304 response: %s", u.String())
+		}
+		return
+	}
+
+	if store != nil {
+		key := keyFromURL(u)
+		now := time.Now().UTC()
+		entry := StoredEntry{
+			Key:         key,
+			URL:         u.String(),
+			Host:        u.Hostname(),
+			Status:      resp.StatusCode,
+			Headers:     resp.Header.Clone(),
+			Body:        body,
+			StoredAt:    now,
+			ExpiresAt:   now.Add(time.Duration(ttl) * time.Second),
+			Size:        int64(len(body)),
+			ContentType: resp.Header.Get("Content-Type"),
+		}
+		if err := store.SaveCacheEntry(ctx, entry); err != nil {
+			if verbose {
+				log.Printf("[VERBOSE] cache store write error: %v", err)
+			}
+			return
+		}
+		if verbose {
+			log.Printf("[VERBOSE] cached %s -> sqlite:%s", u.String(), key)
+		}
 		return
 	}
 

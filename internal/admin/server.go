@@ -47,6 +47,7 @@ type Options struct {
 	EventBus      *events.Bus
 	SaveConfig    func(context.Context, *cfgpkg.Config) error
 	ReloadConfig  func(context.Context) error
+	Restart       func(context.Context) error
 	RotateCA      func(context.Context) error
 	ImportCA      func(context.Context, string, string) error
 	PublishEvent  func(events.Event)
@@ -100,7 +101,7 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/deployments", s.handleDeployments)
 	apiMux.HandleFunc("/api/deployments/current", s.handleCurrentDeployment)
 	apiMux.HandleFunc("/api/deployments/current/reload", s.handleDeploymentReload)
-	apiMux.HandleFunc("/api/deployments/current/restart", s.handleNotImplemented)
+	apiMux.HandleFunc("/api/deployments/current/restart", s.handleDeploymentRestart)
 	apiMux.HandleFunc("/api/logs", s.handleLogs)
 	apiMux.HandleFunc("/api/blocks/test", s.handleBlockTest)
 	apiMux.HandleFunc("/api/blocks/ports", s.handleBlockedPorts)
@@ -109,8 +110,10 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/blocks/domains/", s.handleBlockedDomainDetail)
 	apiMux.HandleFunc("/api/blocks/ips", s.handleBlockedIPs)
 	apiMux.HandleFunc("/api/blocks/ips/", s.handleBlockedIPDetail)
+	apiMux.HandleFunc("/api/cache/resource", s.handleCacheResource)
 	apiMux.HandleFunc("/api/cache", s.handleCache)
 	apiMux.HandleFunc("/api/cache/purge", s.handleCachePurge)
+	apiMux.HandleFunc("/api/settings/danger", s.handleSettingsDanger)
 	apiMux.HandleFunc("/api/settings", s.handleSettings)
 	apiMux.HandleFunc("/api/admin/users", s.handleAdminUsers)
 	apiMux.HandleFunc("/api/admin/users/", s.handleAdminUserDetail)
@@ -132,9 +135,20 @@ func New(options Options) *Server {
 		if err != nil {
 			log.Printf("admin UI unavailable: %v", err)
 		} else {
-			mux.Handle("/admin/", http.StripPrefix("/admin/", http.FileServer(http.FS(dist))))
+			fileServer := http.StripPrefix("/admin/", http.FileServer(http.FS(dist)))
+			mux.HandleFunc("/admin/", func(w http.ResponseWriter, r *http.Request) {
+				assetPath := strings.TrimPrefix(r.URL.Path, "/admin/")
+				if assetPath == "" || !strings.Contains(filepath.Base(assetPath), ".") {
+					r.URL.Path = "/admin/"
+				}
+				fileServer.ServeHTTP(w, r)
+			})
 			mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
-				http.Redirect(w, r, "/admin/", http.StatusFound)
+				target := "/admin/"
+				if r.URL.RawQuery != "" {
+					target += "?" + r.URL.RawQuery
+				}
+				http.Redirect(w, r, target, http.StatusFound)
 			})
 		}
 	}
@@ -157,6 +171,13 @@ func (s *Server) ListenAndServe() error {
 	}
 	s.startEventRecorder()
 	return s.server.ListenAndServe()
+}
+
+func (s *Server) Shutdown(ctx context.Context) error {
+	if s == nil || s.server == nil {
+		return nil
+	}
+	return s.server.Shutdown(ctx)
 }
 
 func (s *Server) startEventRecorder() {
@@ -1013,15 +1034,24 @@ func (s *Server) handleCAImport(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleLeafCertificates(w http.ResponseWriter, r *http.Request) {
 	if s.options.Store == nil {
-		writeJSON(w, http.StatusOK, []any{})
+		writeJSON(w, http.StatusOK, map[string]any{"items": []any{}, "total": 0, "has_more": false})
 		return
 	}
-	records, err := s.options.Store.ListCertificates(r.Context(), 200)
+	limit, offset := paginationParams(r, 10)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
+	page, err := s.options.Store.ListCertificatesPage(r.Context(), limit, offset, query)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
-	writeJSON(w, http.StatusOK, records)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"items":    page.Items,
+		"total":    page.Total,
+		"has_more": page.HasMore,
+		"limit":    limit,
+		"offset":   offset,
+		"q":        query,
+	})
 }
 
 func (s *Server) handleDeployments(w http.ResponseWriter, r *http.Request) {
@@ -1050,6 +1080,23 @@ func (s *Server) handleDeploymentReload(w http.ResponseWriter, r *http.Request) 
 	}
 	s.audit(r, "deployment.reload", map[string]any{"config_path": s.options.ConfigPath})
 	writeJSON(w, http.StatusOK, map[string]string{"status": "reloaded"})
+}
+
+func (s *Server) handleDeploymentRestart(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Restart == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if err := s.options.Restart(r.Context()); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "deployment.restart", map[string]any{"config_path": s.options.ConfigPath})
+	writeJSON(w, http.StatusAccepted, map[string]string{"status": "restarting"})
 }
 
 func (s *Server) handleLogs(w http.ResponseWriter, r *http.Request) {
@@ -1235,14 +1282,40 @@ func (s *Server) handleBlockTest(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) handleCache(w http.ResponseWriter, r *http.Request) {
 	cfg := s.options.Config()
+	limit, offset := paginationParams(r, 10)
+	query := strings.TrimSpace(r.URL.Query().Get("q"))
 	size, count := cacheStats(cfg.Cache.Directory)
+	page := cacheEntries(cfg.Cache.Directory, limit, offset, query)
+	var items any = page.Items
+	itemsTotal := page.Total
+	hasMore := page.HasMore
+	if s.options.Store != nil {
+		if storeSize, storeCount, err := s.options.Store.CacheStats(r.Context()); err == nil {
+			size = storeSize
+			count = storeCount
+		}
+		if storePage, err := s.options.Store.ListCacheEntries(r.Context(), limit, offset, query); err == nil {
+			items = storePage.Items
+			itemsTotal = storePage.Total
+			hasMore = storePage.HasMore
+		}
+	}
+	location := cfg.Cache.Directory
+	if s.options.Store != nil {
+		location = cfg.AdminStore
+	}
 	payload := map[string]any{
-		"enabled":   cfg.Cache.Enabled,
-		"directory": cfg.Cache.Directory,
-		"ttl":       cfg.Cache.TTL,
-		"size":      size,
-		"entries":   count,
-		"items":     cacheEntries(cfg.Cache.Directory, 100),
+		"enabled":     cfg.Cache.Enabled,
+		"directory":   location,
+		"ttl":         cfg.Cache.TTL,
+		"size":        size,
+		"entries":     count,
+		"items":       items,
+		"items_total": itemsTotal,
+		"has_more":    hasMore,
+		"limit":       limit,
+		"offset":      offset,
+		"q":           query,
 	}
 	if s.options.Store != nil {
 		if stats, err := s.options.Store.TrafficStats(r.Context()); err == nil {
@@ -1251,6 +1324,70 @@ func (s *Server) handleCache(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusOK, payload)
+}
+
+func (s *Server) handleCacheResource(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	key := strings.TrimSpace(r.URL.Query().Get("key"))
+	if !isCacheKey(key) {
+		http.Error(w, "invalid cache key", http.StatusBadRequest)
+		return
+	}
+
+	if s.options.Store != nil {
+		entry, err := s.options.Store.LoadCacheEntry(r.Context(), key)
+		if err != nil {
+			http.Error(w, "cached resource not found", http.StatusNotFound)
+			return
+		}
+		writeCachedResource(w, entry.URL, entry.Status, entry.Headers, entry.Body)
+		return
+	}
+
+	cfg := s.options.Config()
+	cached, err := cachedResponseByKey(cfg.Cache.Directory, key)
+	if err != nil {
+		http.Error(w, "cached resource not found", http.StatusNotFound)
+		return
+	}
+	writeCachedResource(w, cached.URL, cached.Status, cached.Header, cached.Body)
+}
+
+func writeCachedResource(w http.ResponseWriter, rawURL string, status int, headers http.Header, body []byte) {
+	contentType := headers.Get("Content-Type")
+	if contentType == "" {
+		contentType = http.DetectContentType(body)
+	}
+
+	w.Header().Set("Content-Type", contentType)
+	copyCachedResourceHeader(w.Header(), headers, "Content-Encoding")
+	copyCachedResourceHeader(w.Header(), headers, "Content-Language")
+	copyCachedResourceHeader(w.Header(), headers, "Content-Location")
+	copyCachedResourceHeader(w.Header(), headers, "ETag")
+	copyCachedResourceHeader(w.Header(), headers, "Last-Modified")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Security-Policy", "sandbox")
+	w.Header().Set("Referrer-Policy", "no-referrer")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	if rawURL != "" {
+		w.Header().Set("X-Original-URL", rawURL)
+	}
+
+	if status < 100 || status > 599 {
+		status = http.StatusOK
+	}
+	w.WriteHeader(status)
+	_, _ = w.Write(body)
+}
+
+func copyCachedResourceHeader(dst, src http.Header, name string) {
+	for _, value := range src.Values(name) {
+		dst.Add(name, value)
+	}
 }
 
 func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
@@ -1265,7 +1402,13 @@ func (s *Server) handleCachePurge(w http.ResponseWriter, r *http.Request) {
 	_ = json.NewDecoder(r.Body).Decode(&input)
 
 	cfg := s.options.Config()
-	removed, err := purgeCache(cfg.Cache.Directory, input.Domain)
+	var removed int
+	var err error
+	if s.options.Store != nil {
+		removed, err = s.options.Store.PurgeCache(r.Context(), input.Domain)
+	} else {
+		removed, err = purgeCache(cfg.Cache.Directory, input.Domain)
+	}
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
@@ -1380,6 +1523,56 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	writeJSON(w, http.StatusOK, safeSettings(cfg))
+}
+
+func (s *Server) handleSettingsDanger(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Action  string `json:"action"`
+		Confirm bool   `json:"confirm"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	if !input.Confirm {
+		http.Error(w, "confirmation is required", http.StatusBadRequest)
+		return
+	}
+	action := strings.ToLower(strings.TrimSpace(input.Action))
+	switch action {
+	case "all":
+		if err := s.options.Store.PurgeResearchData(r.Context(), true); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_all", nil)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "purged", "action": action})
+	case "except_cache":
+		if err := s.options.Store.PurgeResearchData(r.Context(), false); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_except_cache", nil)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "purged", "action": action})
+	case "cache":
+		removed, err := s.options.Store.PurgeCache(r.Context(), "")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "settings.danger.purge_cache", map[string]any{"removed": removed})
+		writeJSON(w, http.StatusOK, map[string]any{"status": "purged", "action": action, "removed": removed})
+	default:
+		http.Error(w, "unknown dangerous action", http.StatusBadRequest)
+	}
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
@@ -1770,13 +1963,21 @@ func cacheStats(dir string) (int64, int) {
 	return size, entries
 }
 
-func cacheEntries(dir string, limit int) []map[string]any {
+type cacheEntriesPage struct {
+	Items   []map[string]any
+	Total   int
+	HasMore bool
+}
+
+func cacheEntries(dir string, limit, offset int, query string) cacheEntriesPage {
 	if strings.TrimSpace(dir) == "" || limit <= 0 {
-		return []map[string]any{}
+		return cacheEntriesPage{Items: []map[string]any{}}
 	}
 	items := []map[string]any{}
+	total := 0
+	needle := strings.ToLower(strings.TrimSpace(query))
 	_ = filepath.WalkDir(dir, func(path string, d fs.DirEntry, err error) error {
-		if err != nil || d.IsDir() || len(items) >= limit || filepath.Ext(path) != ".json" {
+		if err != nil || d.IsDir() || filepath.Ext(path) != ".json" {
 			return nil
 		}
 		data, err := os.ReadFile(path)
@@ -1786,15 +1987,37 @@ func cacheEntries(dir string, limit int) []map[string]any {
 		var cached struct {
 			URL       string `json:"url"`
 			Status    int    `json:"status"`
+			Body      []byte `json:"body"`
 			StoredAt  int64  `json:"stored_at_unix"`
 			ExpiresAt int64  `json:"expires_at_unix"`
 		}
 		if err := json.Unmarshal(data, &cached); err != nil {
 			return nil
 		}
+		if cached.ExpiresAt > 0 && time.Now().Unix() > cached.ExpiresAt {
+			_ = os.Remove(path)
+			return nil
+		}
+		if cached.Status == http.StatusNotModified && len(cached.Body) == 0 {
+			_ = os.Remove(path)
+			return nil
+		}
 		info, _ := d.Info()
+		key := strings.TrimSuffix(filepath.Base(path), filepath.Ext(path))
+		if needle != "" && !cacheEntryMatches(needle, key, cached.URL, cached.Status, cached.ExpiresAt, info) {
+			return nil
+		}
+		total++
+		if total <= offset {
+			return nil
+		}
+		if len(items) >= limit {
+			return nil
+		}
 		item := map[string]any{
 			"path":       path,
+			"key":        key,
+			"view_url":   "/api/cache/resource?key=" + url.QueryEscape(key),
 			"url":        cached.URL,
 			"status":     cached.Status,
 			"stored_at":  time.Unix(cached.StoredAt, 0).UTC(),
@@ -1806,7 +2029,102 @@ func cacheEntries(dir string, limit int) []map[string]any {
 		items = append(items, item)
 		return nil
 	})
-	return items
+	return cacheEntriesPage{
+		Items:   items,
+		Total:   total,
+		HasMore: offset+len(items) < total,
+	}
+}
+
+func cacheEntryMatches(needle, key, rawURL string, status int, expiresAt int64, info fs.FileInfo) bool {
+	haystacks := []string{
+		strings.ToLower(key),
+		strings.ToLower(rawURL),
+		strconv.Itoa(status),
+		time.Unix(expiresAt, 0).UTC().Format(time.RFC3339),
+	}
+	if info != nil {
+		haystacks = append(haystacks, strconv.FormatInt(info.Size(), 10))
+	}
+	for _, value := range haystacks {
+		if strings.Contains(value, needle) {
+			return true
+		}
+	}
+	return false
+}
+
+type cachedResponse struct {
+	URL       string      `json:"url"`
+	Status    int         `json:"status"`
+	Header    http.Header `json:"header"`
+	Body      []byte      `json:"body"`
+	ExpiresAt int64       `json:"expires_at_unix"`
+}
+
+func cachedResponseByKey(dir, key string) (*cachedResponse, error) {
+	if strings.TrimSpace(dir) == "" || !isCacheKey(key) {
+		return nil, os.ErrNotExist
+	}
+	root, err := filepath.Abs(dir)
+	if err != nil {
+		return nil, err
+	}
+
+	var found *cachedResponse
+	err = filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() || found != nil || filepath.Ext(path) != ".json" {
+			return nil
+		}
+		if !strings.EqualFold(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)), key) {
+			return nil
+		}
+		abs, err := filepath.Abs(path)
+		if err != nil {
+			return nil
+		}
+		rel, err := filepath.Rel(root, abs)
+		if err != nil || strings.HasPrefix(rel, "..") || filepath.IsAbs(rel) {
+			return nil
+		}
+		data, err := os.ReadFile(abs)
+		if err != nil {
+			return err
+		}
+		var cached cachedResponse
+		if err := json.Unmarshal(data, &cached); err != nil {
+			return err
+		}
+		if cached.ExpiresAt > 0 && time.Now().Unix() > cached.ExpiresAt {
+			_ = os.Remove(abs)
+			return os.ErrNotExist
+		}
+		if cached.Status == http.StatusNotModified && len(cached.Body) == 0 {
+			_ = os.Remove(abs)
+			return os.ErrNotExist
+		}
+		found = &cached
+		return fs.SkipAll
+	})
+	if err != nil && err != fs.SkipAll {
+		return nil, err
+	}
+	if found == nil {
+		return nil, os.ErrNotExist
+	}
+	return found, nil
+}
+
+func isCacheKey(key string) bool {
+	if len(key) != 64 {
+		return false
+	}
+	for _, ch := range key {
+		if (ch < '0' || ch > '9') && (ch < 'a' || ch > 'f') && (ch < 'A' || ch > 'F') {
+			return false
+		}
+	}
+	return true
 }
 
 func purgeCache(dir, domain string) (int, error) {

@@ -44,6 +44,23 @@ const VIEWS = [
   ] },
 ];
 
+const VIEW_SLUGS = {
+  Dashboard: "",
+  Traffic: "traffic",
+  Repeater: "repeater",
+  "Threat Scanner": "threat-scanner",
+  Certificates: "certificates",
+  Scopes: "scopes",
+  Blocks: "blocks",
+  Deployments: "deployments",
+  Cache: "cache",
+  Settings: "settings",
+  "Admin Users": "admin-users",
+  "Audit Log": "audit-log",
+};
+
+const SLUG_VIEWS = Object.fromEntries(Object.entries(VIEW_SLUGS).map(([name, slug]) => [slug, name]));
+
 const METHOD_CLASS = {
   GET: "get",
   POST: "post",
@@ -51,6 +68,30 @@ const METHOD_CLASS = {
   PATCH: "patch",
   DELETE: "delete",
 };
+
+function currentViewFromURL() {
+  const params = new URLSearchParams(location.search);
+  const queryView = params.get("view");
+  if (queryView && SLUG_VIEWS[queryView]) return SLUG_VIEWS[queryView];
+
+  const path = location.pathname.replace(/\/+$/, "");
+  const prefix = "/admin";
+  if (path === prefix || path === "") return "Dashboard";
+  if (path.startsWith(`${prefix}/`)) {
+    const slug = decodeURIComponent(path.slice(prefix.length + 1).split("/")[0] || "");
+    return SLUG_VIEWS[slug] || "Dashboard";
+  }
+  return "Dashboard";
+}
+
+function adminPathForView(view) {
+  const slug = VIEW_SLUGS[view] || "";
+  const params = new URLSearchParams(location.search);
+  params.delete("view");
+  const query = params.toString();
+  const path = slug ? `/admin/${slug}` : "/admin/";
+  return query ? `${path}?${query}` : path;
+}
 
 function getToken() {
   const value = new URLSearchParams(location.search).get("token") || localStorage.getItem("adminToken") || "";
@@ -93,6 +134,13 @@ function putJSON(path, body) {
 
 function del(path) {
   return request(path, { method: "DELETE" });
+}
+
+function authenticatedHref(path) {
+  const url = new URL(path, window.location.origin);
+  const token = getToken();
+  if (token) url.searchParams.set("token", token);
+  return `${url.pathname}${url.search}${url.hash}`;
 }
 
 function scopeQuery(scopeID) {
@@ -139,13 +187,27 @@ function useAsync(factory, deps) {
 }
 
 function App() {
-  const [current, setCurrent] = useState("Dashboard");
+  const [current, setCurrent] = useState(currentViewFromURL);
   const [refreshKey, setRefreshKey] = useState(0);
   const [status, setStatus] = useState("checking");
   const [confirmed, setConfirmed] = useState(localStorage.getItem("responsibleUseConfirmed") === "true");
   const [scopes, setScopes] = useState([]);
   const [selectedScope, setSelectedScope] = useState(localStorage.getItem("selectedScope") || "all");
   const refresh = () => setRefreshKey((v) => v + 1);
+
+  useEffect(() => {
+    const onPopState = () => setCurrent(currentViewFromURL());
+    window.addEventListener("popstate", onPopState);
+    return () => window.removeEventListener("popstate", onPopState);
+  }, []);
+
+  useEffect(() => {
+    const nextPath = adminPathForView(current);
+    const currentPath = `${location.pathname}${location.search}`;
+    if (nextPath !== currentPath) {
+      history.pushState({ view: current }, "", nextPath);
+    }
+  }, [current]);
 
   useEffect(() => {
     let cancelled = false;
@@ -271,9 +333,11 @@ function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes })
   const requestRef = useRef(0);
   const searchRef = useRef(search);
   const scopeRef = useRef(selectedScope);
+  const selectedRef = useRef(selected);
 
   useEffect(() => { searchRef.current = search; }, [search]);
   useEffect(() => { scopeRef.current = selectedScope; }, [selectedScope]);
+  useEffect(() => { selectedRef.current = selected; }, [selected]);
 
   const trafficPagePath = (offset) => {
     const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
@@ -323,6 +387,7 @@ function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes })
       "traffic.response.completed",
       "traffic.tunnel.opened",
       "traffic.blocked",
+      "traffic.body.captured",
     ];
     let cancelled = false;
     const handleLiveEvent = async (event) => {
@@ -336,6 +401,9 @@ function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes })
           const without = current.filter((item) => item.id !== flow.id);
           return [flow, ...without].slice(0, Math.max(pageSize, without.length + 1));
         });
+        if (selectedRef.current === id) {
+          setDetail(flow);
+        }
         setHasMore(true);
       } catch {
         // Live updates are opportunistic; the paged list remains the source of truth.
@@ -360,9 +428,24 @@ function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes })
     if (!selected) return;
     let cancelled = false;
     setDetailError("");
-    api(`/api/traffic/${encodeURIComponent(selected)}`)
-      .then((flow) => !cancelled && setDetail(flow))
-      .catch((err) => !cancelled && setDetailError(err.message));
+    const loadDetail = () => api(`/api/traffic/${encodeURIComponent(selected)}`)
+      .then((flow) => {
+        if (!cancelled) setDetail(flow);
+        return flow;
+      })
+      .catch((err) => {
+        if (!cancelled) setDetailError(err.message);
+        return null;
+      });
+    loadDetail().then((flow) => {
+      if (cancelled || flow?.request_body || flow?.response_body) return;
+      const delays = [500, 1500, 3000];
+      delays.forEach((delay) => {
+        setTimeout(() => {
+          if (!cancelled) loadDetail();
+        }, delay);
+      });
+    });
     return () => { cancelled = true; };
   }, [selected, refreshKey]);
 
@@ -692,20 +775,60 @@ function compareRuns(run, previous) {
 }
 
 function CertificatesView({ refreshKey, refresh }) {
-  const state = useAsync(async () => {
-    const [ca, leaf] = await Promise.all([api("/api/certificates/ca"), api("/api/certificates/leaf")]);
-    return { ca, leaf };
-  }, [refreshKey]);
+  const state = useAsync(() => api("/api/certificates/ca"), [refreshKey]);
   const [paths, setPaths] = useState({ cert_path: "", key_path: "" });
+  const [search, setSearch] = useState("");
+  const [leaf, setLeaf] = useState([]);
+  const [leafTotal, setLeafTotal] = useState(0);
+  const [leafHasMore, setLeafHasMore] = useState(false);
+  const [leafLoading, setLeafLoading] = useState(true);
+  const [leafLoadingMore, setLeafLoadingMore] = useState(false);
+  const [leafError, setLeafError] = useState("");
+  const leafRequestRef = useRef(0);
+  const pageSize = 10;
+
+  const leafPagePath = (offset, term = search) => {
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    if (term.trim()) params.set("q", term.trim());
+    return `/api/certificates/leaf?${params.toString()}`;
+  };
+
+  const loadLeafPage = async (offset, replace = false, term = search) => {
+    const requestID = ++leafRequestRef.current;
+    replace ? setLeafLoading(true) : setLeafLoadingMore(true);
+    setLeafError("");
+    try {
+      const page = await api(leafPagePath(offset, term));
+      if (requestID !== leafRequestRef.current) return;
+      const nextItems = page.items || [];
+      setLeaf((current) => replace ? nextItems : [...current, ...nextItems]);
+      setLeafTotal(page.total || 0);
+      setLeafHasMore(Boolean(page.has_more));
+    } catch (err) {
+      if (requestID === leafRequestRef.current) setLeafError(err.message);
+    } finally {
+      if (requestID === leafRequestRef.current) {
+        setLeafLoading(false);
+        setLeafLoadingMore(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    setLeaf([]);
+    setLeafHasMore(false);
+    loadLeafPage(0, true, search);
+  }, [refreshKey, search]);
+
   if (state.loading || state.error) return <PageState state={state} />;
-  const { ca, leaf } = state.data;
+  const ca = state.data;
   return (
     <div className="page-stack">
       <PageTitle title="Certificates" subtitle="CA trust material and generated leaf certificates." />
       <div className="grid metrics-grid"><Metric label="Subject" value={ca.subject} /><Metric label="Expires" value={ca.expires_at} /><Metric label="Path" value={ca.path} /></div>
       <div className="panel"><h2>Fingerprint</h2><code>{ca.fingerprint}</code><div className="actions"><a className="primary" href={`/api/certificates/ca/download?token=${encodeURIComponent(getToken())}`}><Download />Download CA</a><button className="secondary" onClick={async () => { await post("/api/certificates/ca/rotate"); refresh(); }}><RefreshCw />Rotate CA</button></div><div className="actions"><input placeholder="cert path" value={paths.cert_path} onChange={(e) => setPaths({ ...paths, cert_path: e.target.value })} /><input placeholder="key path" value={paths.key_path} onChange={(e) => setPaths({ ...paths, key_path: e.target.value })} /><button className="secondary" onClick={async () => { await postJSON("/api/certificates/ca/import", paths); refresh(); }}>Import CA</button></div></div>
       <div className="panel"><h2>Trust Instructions</h2><table><tbody><tr><td>Windows</td><td>Import into Trusted Root Certification Authorities.</td></tr><tr><td>macOS</td><td>Import into Keychain Access and set Always Trust.</td></tr><tr><td>Linux</td><td>Install into the system CA store or browser-specific store.</td></tr><tr><td>Firefox</td><td>Import under Privacy & Security, Certificates, Authorities.</td></tr></tbody></table></div>
-      <div className="panel"><h2>Leaf Certificates</h2><table><thead><tr><th>Host</th><th>Subject</th><th>Expires</th><th>Fingerprint</th></tr></thead><tbody>{leaf.map((cert) => <tr key={cert.host}><td>{cert.host}</td><td>{cert.subject}</td><td>{cert.expires_at}</td><td><code>{cert.fingerprint}</code></td></tr>)}</tbody></table></div>
+      <div className="panel"><div className="detail-topbar"><div><h2>Leaf Certificates</h2><p className="muted">Showing {leaf.length} of {leafTotal} matching certificates.</p></div><div className="list-filter"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search host, subject, fingerprint..." /></div></div>{leafError && <p className="error-text">{leafError}</p>}<table><thead><tr><th>Host</th><th>Subject</th><th>Expires</th><th>Fingerprint</th></tr></thead><tbody>{leaf.length ? leaf.map((cert) => <tr key={cert.id || cert.host}><td>{cert.host}</td><td>{cert.subject}</td><td>{cert.expires_at}</td><td><code>{cert.fingerprint}</code></td></tr>) : <tr><td colSpan="4">{leafLoading ? "Loading certificates..." : "No leaf certificates found."}</td></tr>}</tbody></table><div className="list-status">{leafLoading && leaf.length > 0 ? "Refreshing..." : leafLoadingMore ? "Loading more..." : leafHasMore ? <button className="secondary" onClick={() => loadLeafPage(leaf.length)}>Load 10 more</button> : leaf.length ? "End of certificates." : ""}</div></div>
     </div>
   );
 }
@@ -740,17 +863,92 @@ function DeploymentsView({ refreshKey, refresh }) {
     const [deployment, logs] = await Promise.all([api("/api/deployments/current"), api("/api/logs")]);
     return { deployment, logs };
   }, [refreshKey]);
+  const [restartState, setRestartState] = useState({ status: "idle", message: "" });
   if (state.loading || state.error) return <PageState state={state} />;
   const { deployment, logs } = state.data;
-  return <div className="page-stack"><PageTitle title="Deployments" subtitle="Runtime controls, profiles, and recent log output." /><div className="grid metrics-grid"><Metric label="Status" value={deployment.status} /><Metric label="Listen address" value={deployment.listen_addr} /><Metric label="MITM" value={deployment.mitm_enabled ? "enabled" : "disabled"} /><Metric label="Config" value={deployment.config_path || "defaults"} /></div><div className="panel"><h2>Controls</h2><div className="actions"><button className="secondary" onClick={async () => { await post("/api/deployments/current/reload"); refresh(); }}><RefreshCw />Reload config</button><button className="secondary" onClick={async () => { await post("/api/deployments/current/restart"); refresh(); }}>Restart</button></div></div><TextCard title="Logs" value={(logs || []).join("\n")} /><div className="panel"><h2>Profiles</h2><table><thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead><tbody>{(deployment.profiles || []).map((p) => <tr key={p.name}><td>{p.name}</td><td>{p.kind}</td><td>{p.description}</td></tr>)}</tbody></table></div></div>;
+  const restarting = restartState.status === "pending";
+  const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+  const restart = async () => {
+    const previousStarted = deployment.started_at || "";
+    setRestartState({ status: "pending", message: "Restart requested. Waiting for the process to come back..." });
+    try {
+      await post("/api/deployments/current/restart");
+    } catch (error) {
+      setRestartState({ status: "error", message: `Restart request failed: ${error.message}` });
+      return;
+    }
+    const deadline = Date.now() + 30000;
+    let sawUnavailable = false;
+    while (Date.now() < deadline) {
+      await delay(900);
+      try {
+        const next = await api(`/api/deployments/current?restart_poll=${Date.now()}`);
+        if (next.started_at && next.started_at !== previousStarted) {
+          setRestartState({ status: "success", message: "Restart complete. The replacement process is responding." });
+          refresh();
+          return;
+        }
+        setRestartState({ status: "pending", message: sawUnavailable ? "Process is responding again; waiting for the new start time..." : "Restart accepted. Waiting for shutdown handoff..." });
+      } catch {
+        sawUnavailable = true;
+        setRestartState({ status: "pending", message: "Process is temporarily unavailable during restart..." });
+      }
+    }
+    setRestartState({ status: "error", message: "Restart status timed out. Refresh the page to check whether the process came back." });
+  };
+  return <div className="page-stack"><PageTitle title="Deployments" subtitle="Runtime controls, profiles, and recent log output." /><div className="grid metrics-grid"><Metric label="Status" value={deployment.status} /><Metric label="Listen address" value={deployment.listen_addr} /><Metric label="MITM" value={deployment.mitm_enabled ? "enabled" : "disabled"} /><Metric label="Config" value={deployment.config_path || "defaults"} /></div><div className="panel"><h2>Controls</h2><div className="actions"><button className="secondary" disabled={restarting} onClick={async () => { await post("/api/deployments/current/reload"); refresh(); }}><RefreshCw />Reload config</button><button className="secondary" disabled={restarting} onClick={restart}><RefreshCw />{restarting ? "Restarting..." : "Restart"}</button></div>{restartState.message && <div className={`restart-feedback ${restartState.status}`}>{restartState.message}</div>}</div><TextCard title="Logs" value={(logs || []).join("\n")} /><div className="panel"><h2>Profiles</h2><table><thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead><tbody>{(deployment.profiles || []).map((p) => <tr key={p.name}><td>{p.name}</td><td>{p.kind}</td><td>{p.description}</td></tr>)}</tbody></table></div></div>;
 }
 
 function CacheView({ refreshKey, refresh }) {
-  const state = useAsync(() => api("/api/cache"), [refreshKey]);
   const [domain, setDomain] = useState("");
-  if (state.loading || state.error) return <PageState state={state} />;
-  const cache = state.data;
-  return <div className="page-stack"><PageTitle title="Cache" subtitle="HTTP response cache inventory and purge controls." /><div className="grid metrics-grid"><Metric label="Enabled" value={cache.enabled ? "yes" : "no"} /><Metric label="Directory" value={cache.directory} /><Metric label="TTL" value={`${cache.ttl}s`} /><Metric label="Entries" value={cache.entries} /><Metric label="Hit rate" value={`${cache.hits || 0}/${(cache.hits || 0) + (cache.misses || 0)}`} /><Metric label="Size" value={`${cache.size} bytes`} /></div><div className="panel"><h2>Purge</h2><div className="actions"><input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="optional domain" /><button className="secondary" onClick={async () => { await postJSON("/api/cache/purge", { domain }); refresh(); }}>Purge</button></div></div><div className="panel"><h2>Cached Entries</h2><table><thead><tr><th>URL</th><th>Status</th><th>Expires</th><th>Size</th></tr></thead><tbody>{(cache.items || []).map((i) => <tr key={i.url}><td>{i.url}</td><td>{i.status}</td><td>{i.expires_at}</td><td>{i.size || 0}</td></tr>)}</tbody></table></div></div>;
+  const [search, setSearch] = useState("");
+  const [cache, setCache] = useState(null);
+  const [items, setItems] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState("");
+  const [hasMore, setHasMore] = useState(false);
+  const [itemsTotal, setItemsTotal] = useState(0);
+  const requestRef = useRef(0);
+  const pageSize = 10;
+
+  const cachePagePath = (offset, term = search) => {
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    if (term.trim()) params.set("q", term.trim());
+    return `/api/cache?${params.toString()}`;
+  };
+
+  const loadCachePage = async (offset, replace = false, term = search) => {
+    const requestID = ++requestRef.current;
+    replace ? setLoading(true) : setLoadingMore(true);
+    setError("");
+    try {
+      const page = await api(cachePagePath(offset, term));
+      if (requestID !== requestRef.current) return;
+      setCache(page);
+      setItems((current) => replace ? (page.items || []) : [...current, ...(page.items || [])]);
+      setHasMore(Boolean(page.has_more));
+      setItemsTotal(page.items_total || 0);
+    } catch (err) {
+      if (requestID === requestRef.current) setError(err.message);
+    } finally {
+      if (requestID === requestRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
+    }
+  };
+
+  useEffect(() => {
+    setHasMore(false);
+    setItems([]);
+    loadCachePage(0, true, search);
+  }, [refreshKey, search]);
+
+  if (!cache && loading) return <PageState state={{ loading: true }} />;
+  if (!cache && error) return <PageState state={{ error }} />;
+
+  return <div className="page-stack"><PageTitle title="Cache" subtitle="HTTP response cache inventory and purge controls." /><div className="grid metrics-grid"><Metric label="Enabled" value={cache.enabled ? "yes" : "no"} /><Metric label="Store" value={cache.directory} /><Metric label="TTL" value={`${cache.ttl}s`} /><Metric label="Entries" value={cache.entries} /><Metric label="Hit rate" value={`${cache.hits || 0}/${(cache.hits || 0) + (cache.misses || 0)}`} /><Metric label="Size" value={`${cache.size} bytes`} /></div><div className="panel"><h2>Purge</h2><div className="actions"><input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="optional domain" /><button className="secondary" onClick={async () => { await postJSON("/api/cache/purge", { domain }); setDomain(""); refresh(); }}>Purge</button></div></div><div className="panel"><div className="detail-topbar"><div><h2>Cached Entries</h2><p className="muted">Showing {items.length} of {itemsTotal} matching entries.</p></div><div className="list-filter"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search URL, key, status, size..." /></div></div>{error && <p className="error-text">{error}</p>}<table><thead><tr><th>URL</th><th>Status</th><th>Expires</th><th>Size</th></tr></thead><tbody>{items.length ? items.map((i) => <tr key={i.key || i.url}><td><a className="cache-link" href={authenticatedHref(i.view_url || `/api/cache/resource?key=${encodeURIComponent(i.key || "")}`)} target="_blank" rel="noreferrer">{i.url || i.key}</a></td><td>{i.status}</td><td>{i.expires_at}</td><td>{i.size || 0}</td></tr>) : <tr><td colSpan="4">{loading ? "Loading cached entries..." : "No cached entries found."}</td></tr>}</tbody></table><div className="list-status">{loading && items.length > 0 ? "Refreshing..." : loadingMore ? "Loading more..." : hasMore ? <button className="secondary" onClick={() => loadCachePage(items.length)}>Load 10 more</button> : items.length ? "End of cached entries." : ""}</div></div></div>;
 }
 
 function ScopesView({ scopes, refresh, setSelectedScope }) {
@@ -867,7 +1065,12 @@ function SettingsView({ refreshKey, refresh }) {
   if (state.loading || state.error || !form) return <PageState state={state} />;
   const capture = form.traffic_capture || {};
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
-  return <div className="page-stack"><PageTitle title="Settings" subtitle="Runtime behavior and capture policy." /><div className="panel"><div className="detail-topbar"><h2>Settings</h2><button className="primary" onClick={async () => { await putJSON("/api/settings", form); refresh(); }}><Save />Save</button></div><div className="settings-grid"><label><input type="checkbox" checked={!!form.enable_mitm} onChange={(e) => set({ enable_mitm: e.target.checked })} /> Enable MITM</label><label><input type="checkbox" checked={!!form.verbose_logging} onChange={(e) => set({ verbose_logging: e.target.checked })} /> Verbose logging</label><label><input type="checkbox" checked={!!form.log_requests} onChange={(e) => set({ log_requests: e.target.checked })} /> Request logging</label><label>TLS minimum<input value={form.min_tls_version || ""} onChange={(e) => set({ min_tls_version: e.target.value })} /></label><label>Idle timeout<input type="number" value={form.idle_timeout_seconds || 0} onChange={(e) => set({ idle_timeout_seconds: Number(e.target.value) })} /></label></div><h3>Traffic Capture</h3><div className="settings-grid"><label><input type="checkbox" checked={!!capture.store_bodies} onChange={(e) => set({ traffic_capture: { ...capture, store_bodies: e.target.checked } })} /> Store body samples</label><label><input type="checkbox" checked={capture.redact_bodies !== false} onChange={(e) => set({ traffic_capture: { ...capture, redact_bodies: e.target.checked } })} /> Redact body samples</label><label>Max body bytes<input type="number" value={capture.max_body_bytes || 32768} onChange={(e) => set({ traffic_capture: { ...capture, max_body_bytes: Number(e.target.value) } })} /></label></div><h3>Excluded Domains</h3><textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} /><CodeCard title="Cache" value={form.cache || {}} /></div></div>;
+  const danger = async (action, message) => {
+    if (!confirm(message)) return;
+    await postJSON("/api/settings/danger", { action, confirm: true });
+    refresh();
+  };
+  return <div className="page-stack"><PageTitle title="Settings" subtitle="Runtime behavior and capture policy." /><div className="panel"><div className="detail-topbar"><h2>Settings</h2><button className="primary" onClick={async () => { await putJSON("/api/settings", form); refresh(); }}><Save />Save</button></div><div className="settings-grid"><label><input type="checkbox" checked={!!form.enable_mitm} onChange={(e) => set({ enable_mitm: e.target.checked })} /> Enable MITM</label><label><input type="checkbox" checked={!!form.verbose_logging} onChange={(e) => set({ verbose_logging: e.target.checked })} /> Verbose logging</label><label><input type="checkbox" checked={!!form.log_requests} onChange={(e) => set({ log_requests: e.target.checked })} /> Request logging</label><label>TLS minimum<input value={form.min_tls_version || ""} onChange={(e) => set({ min_tls_version: e.target.value })} /></label><label>Idle timeout<input type="number" value={form.idle_timeout_seconds || 0} onChange={(e) => set({ idle_timeout_seconds: Number(e.target.value) })} /></label></div><h3>Traffic Capture</h3><div className="settings-grid"><label><input type="checkbox" checked={!!capture.store_bodies} onChange={(e) => set({ traffic_capture: { ...capture, store_bodies: e.target.checked } })} /> Store body samples</label><label><input type="checkbox" checked={capture.redact_bodies !== false} onChange={(e) => set({ traffic_capture: { ...capture, redact_bodies: e.target.checked } })} /> Redact body samples</label><label>Max body bytes<input type="number" value={capture.max_body_bytes || 32768} onChange={(e) => set({ traffic_capture: { ...capture, max_body_bytes: Number(e.target.value) } })} /></label></div><h3>Excluded Domains</h3><textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} /><CodeCard title="Cache" value={form.cache || {}} /></div><div className="panel danger-zone"><div className="detail-topbar"><div><h2>Dangerous</h2><p className="muted">Destructive maintenance actions. Each action requires confirmation.</p></div></div><div className="actions"><button className="secondary danger-button" onClick={() => danger("all", "Purge all stored dashboard research data, including cache? This cannot be undone.")}><Trash2 />Purge All Data</button><button className="secondary danger-button" onClick={() => danger("except_cache", "Purge all stored dashboard research data except cache? This cannot be undone.")}><Trash2 />Purge All Except Cache</button><button className="secondary danger-button" onClick={() => danger("cache", "Purge all cached responses? This cannot be undone.")}><Trash2 />Purge Cache</button></div></div></div>;
 }
 
 function AdminUsersView({ refreshKey, refresh }) {

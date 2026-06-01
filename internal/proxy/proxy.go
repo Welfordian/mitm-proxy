@@ -82,6 +82,12 @@ func (p *Proxy) SetConfig(cfg *cfgpkg.Config) {
 	}
 }
 
+func (p *Proxy) SetCacheStore(store cachepkg.BackingStore) {
+	if p.cache != nil {
+		p.cache.SetStore(store)
+	}
+}
+
 // cfg returns the current configuration snapshot safely.
 func (p *Proxy) cfg() *cfgpkg.Config {
 	if v := p.config.Load(); v != nil {

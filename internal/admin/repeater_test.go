@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -15,6 +16,8 @@ import (
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/store"
 )
+
+var adminTestFlowSeq atomic.Int64
 
 func TestRepeaterCloneFromTrafficAndSend(t *testing.T) {
 	st := openAdminTestStore(t)
@@ -252,7 +255,7 @@ func seedTrafficFlow(t *testing.T, st *store.Store, body string) string {
 
 func seedTrafficFlowWithURL(t *testing.T, st *store.Store, rawURL, body string) string {
 	t.Helper()
-	id := time.Now().Format("20060102150405.000000000")
+	id := fmt.Sprintf("%s-%d", time.Now().Format("20060102150405.000000000"), adminTestFlowSeq.Add(1))
 	ctx := context.Background()
 	if err := st.RecordEvent(ctx, events.Event{
 		Topic:     events.TopicTrafficRequestStarted,

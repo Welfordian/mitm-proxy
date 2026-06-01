@@ -7,12 +7,15 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"net/url"
+	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	cachepkg "mitm-proxy/internal/cache"
 	"mitm-proxy/internal/events"
 
 	_ "modernc.org/sqlite"
@@ -36,6 +39,7 @@ var DashboardTables = []string{
 	"repeater_cases",
 	"repeater_runs",
 	"research_scopes",
+	"cache_entries",
 }
 
 type AuditEntry struct {
@@ -94,6 +98,12 @@ type CertificateRecord struct {
 	Fingerprint string    `json:"fingerprint,omitempty"`
 	CreatedAt   time.Time `json:"created_at,omitempty"`
 	ExpiresAt   time.Time `json:"expires_at,omitempty"`
+}
+
+type CertificatePage struct {
+	Items   []CertificateRecord `json:"items"`
+	Total   int                 `json:"total"`
+	HasMore bool                `json:"has_more"`
 }
 
 type TrafficStats struct {
@@ -197,6 +207,235 @@ func (s *Store) Close() error {
 		return nil
 	}
 	return s.db.Close()
+}
+
+func (s *Store) SaveCacheEntry(ctx context.Context, entry cachepkg.StoredEntry) error {
+	if s == nil {
+		return nil
+	}
+	if strings.TrimSpace(entry.Key) == "" || strings.TrimSpace(entry.URL) == "" {
+		return fmt.Errorf("save cache entry: key and url are required")
+	}
+	if entry.Status == http.StatusNotModified && len(entry.Body) == 0 {
+		return nil
+	}
+	if entry.StoredAt.IsZero() {
+		entry.StoredAt = time.Now().UTC()
+	}
+	if entry.ExpiresAt.IsZero() {
+		entry.ExpiresAt = entry.StoredAt
+	}
+	if entry.Host == "" {
+		if parsed, err := url.Parse(entry.URL); err == nil {
+			entry.Host = parsed.Hostname()
+		}
+	}
+	if entry.Headers == nil {
+		entry.Headers = http.Header{}
+	}
+	if entry.Size == 0 {
+		entry.Size = int64(len(entry.Body))
+	}
+	if entry.ContentType == "" {
+		entry.ContentType = entry.Headers.Get("Content-Type")
+	}
+	headersJSON, err := json.Marshal(entry.Headers)
+	if err != nil {
+		return fmt.Errorf("marshal cache headers: %w", err)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO cache_entries (cache_key, url, host, status, headers_json, body, stored_at, expires_at, size, content_type)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		 ON CONFLICT(cache_key) DO UPDATE SET
+			url=excluded.url,
+			host=excluded.host,
+			status=excluded.status,
+			headers_json=excluded.headers_json,
+			body=excluded.body,
+			stored_at=excluded.stored_at,
+			expires_at=excluded.expires_at,
+			size=excluded.size,
+			content_type=excluded.content_type`,
+		entry.Key, entry.URL, entry.Host, entry.Status, string(headersJSON), entry.Body,
+		entry.StoredAt.UTC().Format(time.RFC3339Nano), entry.ExpiresAt.UTC().Format(time.RFC3339Nano), entry.Size, entry.ContentType)
+	if err != nil {
+		return fmt.Errorf("save cache entry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) LoadCacheEntry(ctx context.Context, key string) (cachepkg.StoredEntry, error) {
+	if s == nil {
+		return cachepkg.StoredEntry{}, os.ErrNotExist
+	}
+	var entry cachepkg.StoredEntry
+	var headersJSON, storedAt, expiresAt string
+	row := s.db.QueryRowContext(ctx,
+		`SELECT cache_key, url, host, status, headers_json, body, stored_at, expires_at, size, COALESCE(content_type, '')
+		 FROM cache_entries WHERE cache_key = ?`, key)
+	if err := row.Scan(&entry.Key, &entry.URL, &entry.Host, &entry.Status, &headersJSON, &entry.Body, &storedAt, &expiresAt, &entry.Size, &entry.ContentType); err != nil {
+		if err == sql.ErrNoRows {
+			return cachepkg.StoredEntry{}, os.ErrNotExist
+		}
+		return cachepkg.StoredEntry{}, fmt.Errorf("load cache entry: %w", err)
+	}
+	if err := decodeCacheEntry(&entry, headersJSON, storedAt, expiresAt); err != nil {
+		return cachepkg.StoredEntry{}, err
+	}
+	if shouldPruneCacheEntry(entry) {
+		_ = s.DeleteCacheEntry(ctx, key)
+		return cachepkg.StoredEntry{}, os.ErrNotExist
+	}
+	entry.ViewURL = "/api/cache/resource?key=" + url.QueryEscape(entry.Key)
+	return entry, nil
+}
+
+func (s *Store) ListCacheEntries(ctx context.Context, limit, offset int, search string) (cachepkg.EntryPage, error) {
+	if s == nil {
+		return cachepkg.EntryPage{Items: []cachepkg.StoredEntry{}}, nil
+	}
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+	_ = s.PruneCacheEntries(ctx)
+
+	where, args := cacheSearchWhere(search)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM cache_entries`+where, args...).Scan(&total); err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("count cache entries: %w", err)
+	}
+
+	queryArgs := append(args, limit, offset)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT cache_key, url, host, status, headers_json, stored_at, expires_at, size, COALESCE(content_type, '')
+		 FROM cache_entries`+where+` ORDER BY stored_at DESC LIMIT ? OFFSET ?`, queryArgs...)
+	if err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("list cache entries: %w", err)
+	}
+	defer rows.Close()
+
+	items := []cachepkg.StoredEntry{}
+	for rows.Next() {
+		var entry cachepkg.StoredEntry
+		var headersJSON, storedAt, expiresAt string
+		if err := rows.Scan(&entry.Key, &entry.URL, &entry.Host, &entry.Status, &headersJSON, &storedAt, &expiresAt, &entry.Size, &entry.ContentType); err != nil {
+			return cachepkg.EntryPage{}, fmt.Errorf("scan cache entry: %w", err)
+		}
+		if err := decodeCacheEntry(&entry, headersJSON, storedAt, expiresAt); err != nil {
+			return cachepkg.EntryPage{}, err
+		}
+		entry.ViewURL = "/api/cache/resource?key=" + url.QueryEscape(entry.Key)
+		items = append(items, entry)
+	}
+	if err := rows.Err(); err != nil {
+		return cachepkg.EntryPage{}, fmt.Errorf("iterate cache entries: %w", err)
+	}
+	return cachepkg.EntryPage{Items: items, Total: total, HasMore: offset+len(items) < total}, nil
+}
+
+func (s *Store) CacheStats(ctx context.Context) (int64, int, error) {
+	if s == nil {
+		return 0, 0, nil
+	}
+	_ = s.PruneCacheEntries(ctx)
+	var size sql.NullInt64
+	var count int
+	if err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(size), 0), COUNT(*) FROM cache_entries`).Scan(&size, &count); err != nil {
+		return 0, 0, fmt.Errorf("cache stats: %w", err)
+	}
+	return size.Int64, count, nil
+}
+
+func (s *Store) DeleteCacheEntry(ctx context.Context, key string) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx, `DELETE FROM cache_entries WHERE cache_key = ?`, key)
+	if err != nil {
+		return fmt.Errorf("delete cache entry: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) PurgeCache(ctx context.Context, host string) (int, error) {
+	if s == nil {
+		return 0, nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	var result sql.Result
+	var err error
+	if strings.TrimSpace(host) == "" {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM cache_entries`)
+	} else {
+		result, err = s.db.ExecContext(ctx, `DELETE FROM cache_entries WHERE host = ?`, strings.TrimSpace(host))
+	}
+	if err != nil {
+		return 0, fmt.Errorf("purge cache: %w", err)
+	}
+	removed, _ := result.RowsAffected()
+	return int(removed), nil
+}
+
+func (s *Store) PruneCacheEntries(ctx context.Context) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM cache_entries
+		 WHERE expires_at <= ? OR (status = ? AND size = 0)`,
+		time.Now().UTC().Format(time.RFC3339Nano), http.StatusNotModified)
+	if err != nil {
+		return fmt.Errorf("prune cache entries: %w", err)
+	}
+	return nil
+}
+
+func cacheSearchWhere(search string) (string, []any) {
+	term := strings.ToLower(strings.TrimSpace(search))
+	if term == "" {
+		return "", nil
+	}
+	like := "%" + term + "%"
+	return ` WHERE lower(cache_key) LIKE ?
+		OR lower(url) LIKE ?
+		OR lower(host) LIKE ?
+		OR CAST(status AS TEXT) LIKE ?
+		OR CAST(size AS TEXT) LIKE ?
+		OR lower(COALESCE(content_type, '')) LIKE ?`, []any{like, like, like, like, like, like}
+}
+
+func decodeCacheEntry(entry *cachepkg.StoredEntry, headersJSON, storedAt, expiresAt string) error {
+	entry.Headers = http.Header{}
+	if strings.TrimSpace(headersJSON) != "" {
+		if err := json.Unmarshal([]byte(headersJSON), &entry.Headers); err != nil {
+			return fmt.Errorf("decode cache headers: %w", err)
+		}
+	}
+	entry.StoredAt, _ = time.Parse(time.RFC3339Nano, storedAt)
+	entry.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
+	if entry.ContentType == "" {
+		entry.ContentType = entry.Headers.Get("Content-Type")
+	}
+	return nil
+}
+
+func shouldPruneCacheEntry(entry cachepkg.StoredEntry) bool {
+	return (!entry.ExpiresAt.IsZero() && !entry.ExpiresAt.After(time.Now().UTC())) ||
+		(entry.Status == http.StatusNotModified && len(entry.Body) == 0)
 }
 
 func (s *Store) migrate(ctx context.Context) error {
@@ -348,6 +587,18 @@ func (s *Store) migrate(ctx context.Context) error {
 			url_patterns_json TEXT NOT NULL,
 			method_patterns_json TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS cache_entries (
+			cache_key TEXT PRIMARY KEY,
+			url TEXT NOT NULL,
+			host TEXT NOT NULL,
+			status INTEGER NOT NULL,
+			headers_json TEXT NOT NULL,
+			body BLOB NOT NULL,
+			stored_at TEXT NOT NULL,
+			expires_at TEXT NOT NULL,
+			size INTEGER NOT NULL,
+			content_type TEXT
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -364,6 +615,8 @@ func (s *Store) migrate(ctx context.Context) error {
 	_ = s.addColumnIfMissing(ctx, "repeater_cases", "scope_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "threat_events", "scope_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "admin_users", "role", "TEXT NOT NULL DEFAULT 'read'")
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM certificates WHERE id NOT IN (SELECT MAX(id) FROM certificates GROUP BY COALESCE(host, ''))`)
+	_, _ = s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_host ON certificates(host)`)
 
 	return nil
 }
@@ -700,17 +953,73 @@ func (s *Store) ClearTraffic(ctx context.Context) error {
 	return nil
 }
 
-func (s *Store) ListCertificates(ctx context.Context, limit int) ([]CertificateRecord, error) {
-	if limit <= 0 || limit > 1000 {
-		limit = 200
+func (s *Store) PurgeResearchData(ctx context.Context, includeCache bool) error {
+	if s == nil {
+		return nil
+	}
+	tables := []string{
+		"traffic_headers",
+		"traffic_bodies",
+		"traffic_flows",
+		"certificates",
+		"blocked_ports",
+		"blocked_domains",
+		"blocked_ips",
+		"deployments",
+		"audit_log",
+		"threat_events",
+		"threat_verdict_cache",
+		"threat_rules",
+		"repeater_runs",
+		"repeater_cases",
+		"research_scopes",
+	}
+	if includeCache {
+		tables = append(tables, "cache_entries")
 	}
 
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	for _, table := range tables {
+		if _, err := s.db.ExecContext(ctx, "DELETE FROM "+table); err != nil {
+			return fmt.Errorf("purge %s: %w", table, err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) ListCertificates(ctx context.Context, limit int) ([]CertificateRecord, error) {
+	page, err := s.ListCertificatesPage(ctx, limit, 0, "")
+	if err != nil {
+		return nil, err
+	}
+	return page.Items, nil
+}
+
+func (s *Store) ListCertificatesPage(ctx context.Context, limit, offset int, search string) (CertificatePage, error) {
+	if limit <= 0 {
+		limit = 10
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	if offset < 0 {
+		offset = 0
+	}
+
+	where, args := certificateSearchWhere(search)
+	var total int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM certificates`+where, args...).Scan(&total); err != nil {
+		return CertificatePage{}, fmt.Errorf("count certificates: %w", err)
+	}
+
+	queryArgs := append(args, limit, offset)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, COALESCE(host, ''), COALESCE(subject, ''), COALESCE(fingerprint, ''),
 		 COALESCE(created_at, ''), COALESCE(expires_at, '')
-		 FROM certificates ORDER BY id DESC LIMIT ?`, limit)
+		 FROM certificates`+where+` ORDER BY id DESC LIMIT ? OFFSET ?`, queryArgs...)
 	if err != nil {
-		return nil, fmt.Errorf("query certificates: %w", err)
+		return CertificatePage{}, fmt.Errorf("query certificates: %w", err)
 	}
 	defer rows.Close()
 
@@ -719,16 +1028,29 @@ func (s *Store) ListCertificates(ctx context.Context, limit int) ([]CertificateR
 		var record CertificateRecord
 		var createdAt, expiresAt string
 		if err := rows.Scan(&record.ID, &record.Host, &record.Subject, &record.Fingerprint, &createdAt, &expiresAt); err != nil {
-			return nil, fmt.Errorf("scan certificate: %w", err)
+			return CertificatePage{}, fmt.Errorf("scan certificate: %w", err)
 		}
 		record.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
 		record.ExpiresAt, _ = time.Parse(time.RFC3339Nano, expiresAt)
 		records = append(records, record)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("iterate certificates: %w", err)
+		return CertificatePage{}, fmt.Errorf("iterate certificates: %w", err)
 	}
-	return records, nil
+	return CertificatePage{Items: records, Total: total, HasMore: offset+len(records) < total}, nil
+}
+
+func certificateSearchWhere(search string) (string, []any) {
+	term := strings.ToLower(strings.TrimSpace(search))
+	if term == "" {
+		return "", nil
+	}
+	like := "%" + term + "%"
+	return ` WHERE lower(COALESCE(host, '')) LIKE ?
+		OR lower(COALESCE(subject, '')) LIKE ?
+		OR lower(COALESCE(fingerprint, '')) LIKE ?
+		OR lower(COALESCE(created_at, '')) LIKE ?
+		OR lower(COALESCE(expires_at, '')) LIKE ?`, []any{like, like, like, like, like}
 }
 
 func (s *Store) TrafficStats(ctx context.Context) (TrafficStats, error) {
@@ -1402,7 +1724,12 @@ func (s *Store) recordTrafficBody(ctx context.Context, event events.Event) error
 func (s *Store) recordCertificate(ctx context.Context, event events.Event) error {
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO certificates (host, subject, fingerprint, created_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?)`,
+		 VALUES (?, ?, ?, ?, ?)
+		 ON CONFLICT(host) DO UPDATE SET
+			subject=excluded.subject,
+			fingerprint=excluded.fingerprint,
+			created_at=excluded.created_at,
+			expires_at=excluded.expires_at`,
 		stringPayload(event, "host"), stringPayload(event, "subject"), stringPayload(event, "fingerprint"), stringPayload(event, "created_at"), stringPayload(event, "expires_at"))
 	if err != nil {
 		return fmt.Errorf("record certificate: %w", err)

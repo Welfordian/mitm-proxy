@@ -290,6 +290,17 @@ th, td {
 
 tbody tr:hover { background: var(--ink-100); }
 
+.cache-link {
+  color: var(--accent-700);
+  font-weight: 600;
+  text-decoration: none;
+  overflow-wrap: anywhere;
+}
+
+.cache-link:hover {
+  text-decoration: underline;
+}
+
 code {
   max-width: 100%;
   background: var(--ink-100);
@@ -416,6 +427,41 @@ pre {
 
 .primary:hover { background: var(--signal-700); }
 .danger-button { color: var(--danger-fg); }
+
+.secondary:disabled,
+.primary:disabled {
+  cursor: not-allowed;
+  opacity: 0.62;
+}
+
+.restart-feedback {
+  margin-top: 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--fg-2);
+  background: var(--ink-50);
+}
+
+.restart-feedback.pending {
+  border-color: var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--warning-fg);
+}
+
+.restart-feedback.success {
+  border-color: var(--success-border);
+  background: var(--success-bg);
+  color: var(--success-fg);
+}
+
+.restart-feedback.error {
+  border-color: var(--danger-border);
+  background: var(--danger-bg);
+  color: var(--danger-fg);
+}
 
 input,
 select,

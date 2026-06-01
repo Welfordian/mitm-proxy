@@ -8,6 +8,10 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
+	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	adminpkg "mitm-proxy/internal/admin"
@@ -16,6 +20,11 @@ import (
 	"mitm-proxy/internal/events"
 	proxypkg "mitm-proxy/internal/proxy"
 	"mitm-proxy/internal/store"
+)
+
+const (
+	restartAdminTokenEnv = "MITM_PROXY_RESTART_ADMIN_TOKEN"
+	restartDelayEnv      = "MITM_PROXY_RESTART_DELAY_MS"
 )
 
 func main() {
@@ -42,6 +51,11 @@ func main() {
 	watchConfig := flag.Bool("watch-config", defaultWatchConfig, "Watch config.json for changes and auto-apply (default true)")
 
 	flag.Parse()
+	if delay := restartDelay(); delay > 0 {
+		log.Printf("Delaying startup for restart handoff: %s", delay)
+		time.Sleep(delay)
+	}
+	_ = os.Unsetenv(restartDelayEnv)
 	setFlags := map[string]bool{}
 	flag.Visit(func(f *flag.Flag) {
 		setFlags[f.Name] = true
@@ -101,9 +115,6 @@ func main() {
 
 	log.Printf("Starting proxy (HTTP + HTTPS, HTTP/1.1 + HTTP/2, ws + wss)")
 
-	eventBus := events.NewBus(256)
-	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
-
 	if setFlags["admin-enabled"] {
 		config.AdminEnabled = *adminEnabled
 	}
@@ -123,30 +134,47 @@ func main() {
 		config.AdminStore = *adminStore
 	}
 
+	cacheStore, err := store.Open(config.AdminStore)
+	if err != nil {
+		log.Fatalf("failed to open SQLite cache store: %v", err)
+	}
+	defer cacheStore.Close()
+
+	eventBus := events.NewBus(256)
+	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
+	proxy.SetCacheStore(cacheStore)
+	var proxyServer *http.Server
+	var adminServer *adminpkg.Server
+	var restartMu sync.Mutex
+	restartStarted := false
+
 	if config.AdminEnabled {
 		token := config.AdminToken
 		generatedAuth := false
+		restoredAuth := false
 		if token == "" {
-			var err error
-			token, err = adminpkg.GenerateToken()
-			if err != nil {
-				log.Fatalf("failed to generate admin token: %v", err)
+			if restartToken := strings.TrimSpace(os.Getenv(restartAdminTokenEnv)); restartToken != "" {
+				token = restartToken
+				generatedAuth = true
+				restoredAuth = true
+			} else {
+				var err error
+				token, err = adminpkg.GenerateToken()
+				if err != nil {
+					log.Fatalf("failed to generate admin token: %v", err)
+				}
+				generatedAuth = true
 			}
-			generatedAuth = true
 		}
+		_ = os.Unsetenv(restartAdminTokenEnv)
 		config.AdminToken = token
 
-		auditStore, err := store.Open(config.AdminStore)
-		if err != nil {
-			log.Fatalf("failed to open admin store: %v", err)
-		}
-
-		adminServer := adminpkg.New(adminpkg.Options{
+		adminServer = adminpkg.New(adminpkg.Options{
 			Addr:          config.AdminAddr,
 			Token:         token,
 			ReadToken:     config.AdminReadToken,
 			UIEnabled:     config.AdminUI,
-			Store:         auditStore,
+			Store:         cacheStore,
 			Config:        proxy.CurrentConfig,
 			ConfigPath:    cfgPathForDisplay(*configPath),
 			ProxyVersion:  "dev",
@@ -214,6 +242,32 @@ func main() {
 				})
 				return nil
 			},
+			Restart: func(ctx context.Context) error {
+				restartMu.Lock()
+				if restartStarted {
+					restartMu.Unlock()
+					return nil
+				}
+				if err := spawnRestartProcess(token); err != nil {
+					restartMu.Unlock()
+					log.Printf("restart spawn failed: %v", err)
+					return err
+				}
+				restartStarted = true
+				restartMu.Unlock()
+				go func() {
+					time.Sleep(250 * time.Millisecond)
+					shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+					defer cancel()
+					if adminServer != nil {
+						_ = adminServer.Shutdown(shutdownCtx)
+					}
+					if proxyServer != nil {
+						_ = proxyServer.Shutdown(shutdownCtx)
+					}
+				}()
+				return nil
+			},
 			RotateCA: func(ctx context.Context) error {
 				newCA, err := capkg.Rotate(proxy.CurrentConfig())
 				if err != nil {
@@ -245,7 +299,9 @@ func main() {
 
 		go func() {
 			log.Printf("Admin API/dashboard listening on http://%s/admin/", config.AdminAddr)
-			if generatedAuth {
+			if restoredAuth {
+				log.Printf("Restored generated admin token from restart handoff")
+			} else if generatedAuth {
 				log.Printf("Generated admin token: %s", token)
 			}
 			if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
@@ -329,12 +385,12 @@ func main() {
 		}(cfgPathToWatch)
 	}
 
-	server := &http.Server{
+	proxyServer = &http.Server{
 		Addr:    config.ListenAddr,
 		Handler: proxy,
 	}
 
-	if err := server.ListenAndServe(); err != nil {
+	if err := proxyServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("ListenAndServe: %v", err)
 	}
 }
@@ -372,4 +428,44 @@ func applyCLIOverrides(config *cfgpkg.Config, listenAddr, caCertPath, caKeyPath 
 	if verbose {
 		config.VerboseLogging = true
 	}
+}
+
+func restartDelay() time.Duration {
+	raw := strings.TrimSpace(os.Getenv(restartDelayEnv))
+	if raw == "" {
+		return 0
+	}
+	ms, err := strconv.Atoi(raw)
+	if err != nil || ms <= 0 {
+		return 0
+	}
+	if ms > 10000 {
+		ms = 10000
+	}
+	return time.Duration(ms) * time.Millisecond
+}
+
+func spawnRestartProcess(adminToken string) error {
+	if strings.TrimSpace(adminToken) == "" {
+		return fmt.Errorf("admin token is required for restart handoff")
+	}
+	exe, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("resolve executable: %w", err)
+	}
+	cmd := exec.Command(exe, os.Args[1:]...)
+	cmd.Env = append(os.Environ(),
+		restartAdminTokenEnv+"="+adminToken,
+		restartDelayEnv+"=750",
+	)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	if err := cmd.Start(); err != nil {
+		return fmt.Errorf("start replacement process: %w", err)
+	}
+	if err := cmd.Process.Release(); err != nil {
+		return fmt.Errorf("release replacement process: %w", err)
+	}
+	log.Printf("Started replacement process pid=%d", cmd.Process.Pid)
+	return nil
 }
