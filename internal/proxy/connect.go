@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"mitm-proxy/internal/events"
 )
 
 // tunnelTCP relays raw bytes between client and target.
@@ -55,6 +57,17 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if decision := p.checkPolicy(hostPort); decision.Blocked {
+		p.publish(events.TopicTrafficBlocked, map[string]any{
+			"method":  r.Method,
+			"target":  hostPort,
+			"rule_id": decision.RuleID,
+			"reason":  decision.Reason,
+		}, "")
+		http.Error(w, decision.Reason, p.cfg().BlockResponseStatus)
+		return
+	}
+
 	hj, ok := w.(http.Hijacker)
 
 	if !ok {
@@ -83,6 +96,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if p.cfg().IsDomainExcluded(host) {
 		p.logVerbose("Domain %s is excluded, using plain tunnel", host)
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
 
 		go tunnelTCP(clientConn, hostPort, p)
 
@@ -90,6 +104,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if port != "443" {
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
 		go tunnelTCP(clientConn, hostPort, p)
 
 		return
@@ -97,6 +112,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if !p.cfg().EnableMITM {
 		p.logVerbose("MITM disabled, using plain tunnel for %s", hostPort)
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
 
 		go tunnelTCP(clientConn, hostPort, p)
 

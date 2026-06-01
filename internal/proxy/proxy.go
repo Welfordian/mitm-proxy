@@ -1,10 +1,14 @@
 package proxy
 
 import (
+	"crypto/sha256"
 	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
 	"log"
 	"net"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -14,6 +18,8 @@ import (
 	capkg "mitm-proxy/internal/ca"
 	cachepkg "mitm-proxy/internal/cache"
 	cfgpkg "mitm-proxy/internal/config"
+	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/threats"
 )
 
 // Proxy is the core HTTP handler implementing MITM and tunneling.
@@ -26,10 +32,20 @@ type Proxy struct {
 	mu        sync.Mutex
 	certCache map[string]*tls.Certificate
 	cache     *cachepkg.Cache
+	threats   *threats.Manager
+	events    *events.Bus
 }
 
 // New creates a new Proxy instance with configured upstream transport.
 func New(ca *capkg.CA, config *cfgpkg.Config) *Proxy {
+	return NewWithEvents(ca, config, events.NewBus(128))
+}
+
+func NewWithEvents(ca *capkg.CA, config *cfgpkg.Config, eventBus *events.Bus) *Proxy {
+	if eventBus == nil {
+		eventBus = events.NewBus(128)
+	}
+
 	transport := &http.Transport{
 		Proxy:               nil,
 		ForceAttemptHTTP2:   true,
@@ -48,8 +64,10 @@ func New(ca *capkg.CA, config *cfgpkg.Config) *Proxy {
 		client:    &http.Client{Transport: transport},
 		certCache: make(map[string]*tls.Certificate),
 		cache:     cachepkg.New(config),
+		events:    eventBus,
 	}
 	p.config.Store(config)
+	p.threats = threats.NewManager(p.cfg)
 	return p
 }
 
@@ -72,6 +90,26 @@ func (p *Proxy) cfg() *cfgpkg.Config {
 	return &cfgpkg.Config{}
 }
 
+func (p *Proxy) CurrentConfig() *cfgpkg.Config {
+	return p.cfg()
+}
+
+func (p *Proxy) ThreatScanner() *threats.Manager {
+	return p.threats
+}
+
+func (p *Proxy) EventBus() *events.Bus {
+	return p.events
+}
+
+func (p *Proxy) SetCA(ca *capkg.CA) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	p.ca = ca
+	p.certCache = make(map[string]*tls.Certificate)
+}
+
 func (p *Proxy) getCertForHost(host string) (*tls.Certificate, error) {
 	p.mu.Lock()
 
@@ -88,6 +126,17 @@ func (p *Proxy) getCertForHost(host string) (*tls.Certificate, error) {
 	}
 
 	p.certCache[host] = &leaf
+	payload := map[string]any{"host": host}
+	if len(leaf.Certificate) > 0 {
+		if cert, err := x509.ParseCertificate(leaf.Certificate[0]); err == nil {
+			fingerprint := sha256.Sum256(cert.Raw)
+			payload["subject"] = cert.Subject.String()
+			payload["fingerprint"] = strings.ToUpper(hex.EncodeToString(fingerprint[:]))
+			payload["created_at"] = cert.NotBefore.Format(time.RFC3339Nano)
+			payload["expires_at"] = cert.NotAfter.Format(time.RFC3339Nano)
+		}
+	}
+	p.publish(events.TopicCertGenerated, payload, "")
 
 	return &leaf, nil
 }
@@ -111,6 +160,18 @@ func (p *Proxy) logVerbose(format string, args ...interface{}) {
 	if p.cfg().VerboseLogging {
 		log.Printf("[VERBOSE] "+format, args...)
 	}
+}
+
+func (p *Proxy) publish(topic string, payload map[string]any, requestID string) {
+	if p.events == nil {
+		return
+	}
+	p.events.Publish(events.Event{
+		Topic:     topic,
+		Time:      time.Now().UTC(),
+		Payload:   payload,
+		RequestID: requestID,
+	})
 }
 
 // makeCustomHeader returns a header name derived from the proxy name:

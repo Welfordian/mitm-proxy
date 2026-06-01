@@ -64,6 +64,29 @@ func LoadOrCreate(config *cfgpkg.Config) (*CA, error) {
 	return ca, nil
 }
 
+func LoadFromFiles(certPath, keyPath string) (*CA, error) {
+	certPEM, err := os.ReadFile(certPath)
+	if err != nil {
+		return nil, fmt.Errorf("read CA cert: %w", err)
+	}
+	keyPEM, err := os.ReadFile(keyPath)
+	if err != nil {
+		return nil, fmt.Errorf("read CA key: %w", err)
+	}
+	return parseCA(certPEM, keyPEM)
+}
+
+func Rotate(config *cfgpkg.Config) (*CA, error) {
+	ca, err := generateCA()
+	if err != nil {
+		return nil, err
+	}
+	if err := saveCA(config.CACertOutputPath, config.CAKeyOutputPath, ca); err != nil {
+		return nil, err
+	}
+	return ca, nil
+}
+
 func parseCA(certPEM, keyPEM []byte) (*CA, error) {
 	certBlock, _ := pem.Decode(certPEM)
 	if certBlock == nil {

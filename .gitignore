@@ -2,3 +2,7 @@
 ca-cert.pem
 ca-key.pem
 *.exe
+dashboard.db
+dashboard.db-*
+threats.log
+internal/threats/threats.log

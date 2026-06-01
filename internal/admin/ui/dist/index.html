@@ -1,0 +1,415 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>MITM Proxy Admin</title>
+  <style>
+    :root { color-scheme: light; font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    body { margin: 0; background: #f6f7f9; color: #17202a; }
+    header { height: 56px; display: flex; align-items: center; justify-content: space-between; padding: 0 24px; background: #ffffff; border-bottom: 1px solid #d9dee7; }
+    main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 57px); }
+    nav { border-right: 1px solid #d9dee7; background: #ffffff; padding: 16px; }
+    nav button { width: 100%; height: 36px; margin-bottom: 6px; border: 0; border-radius: 6px; background: transparent; text-align: left; padding: 0 10px; color: #344054; cursor: pointer; }
+    nav button.active { background: #e9edf3; color: #101828; font-weight: 600; }
+    section { padding: 24px; }
+    .panel { background: #ffffff; border: 1px solid #d9dee7; border-radius: 8px; padding: 18px; margin-bottom: 16px; }
+    .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 12px; }
+    .metric { border: 1px solid #e3e7ee; border-radius: 8px; padding: 14px; background: #fbfcfe; }
+    .metric span { display: block; color: #667085; font-size: 13px; }
+    .metric strong { display: block; margin-top: 6px; font-size: 22px; }
+    table { width: 100%; border-collapse: collapse; font-size: 14px; }
+    th, td { border-bottom: 1px solid #e3e7ee; padding: 10px 8px; text-align: left; vertical-align: top; }
+    code { background: #eef2f6; border-radius: 4px; padding: 2px 5px; }
+    pre { overflow: auto; max-height: 320px; background: #0f172a; color: #e2e8f0; border-radius: 8px; padding: 12px; }
+    .badge { display: inline-block; border-radius: 999px; padding: 3px 8px; font-size: 12px; font-weight: 700; background: #e9edf3; }
+    .badge.block, .badge.quarantine { background: #fee4e2; color: #912018; }
+    .badge.warn { background: #fef0c7; color: #93370d; }
+    .badge.allow { background: #dcfae6; color: #05603a; }
+    .rowbutton { border: 0; background: transparent; color: #176b87; cursor: pointer; font-weight: 700; }
+    .actions { display: flex; gap: 8px; flex-wrap: wrap; margin: 12px 0; }
+    .secondary { height: 34px; border: 1px solid #cfd6e2; border-radius: 6px; padding: 0 10px; background: #fff; cursor: pointer; }
+    dialog { border: 0; border-radius: 8px; max-width: 560px; box-shadow: 0 24px 80px rgba(16, 24, 40, .28); }
+    dialog::backdrop { background: rgba(16, 24, 40, .38); }
+    .primary { height: 36px; border: 0; border-radius: 6px; padding: 0 12px; background: #176b87; color: white; cursor: pointer; }
+    @media (max-width: 760px) { main { grid-template-columns: 1fr; } nav { display: flex; overflow-x: auto; border-right: 0; border-bottom: 1px solid #d9dee7; } nav button { min-width: max-content; } }
+  </style>
+</head>
+<body>
+  <header>
+    <strong>MITM Proxy Admin</strong>
+    <span id="status">Checking...</span>
+  </header>
+  <main>
+    <nav id="nav"></nav>
+    <section id="view"></section>
+  </main>
+  <dialog id="consent">
+    <h2>Responsible use confirmation</h2>
+    <p>I confirm this proxy will only be used on systems and networks I am authorised to inspect.</p>
+    <button class="primary" id="accept">Confirm</button>
+  </dialog>
+  <script>
+    const views = ["Dashboard", "Traffic", "Threat Scanner", "Certificates", "Blocks", "Deployments", "Cache", "Settings", "Admin Users", "Audit Log"];
+    const nav = document.querySelector("#nav");
+    const view = document.querySelector("#view");
+    let current = "Dashboard";
+
+    function token() {
+      const value = new URLSearchParams(location.search).get("token") || localStorage.getItem("adminToken") || "";
+      if (value) localStorage.setItem("adminToken", value);
+      return value;
+    }
+
+    async function api(path) {
+      const headers = {};
+      const t = token();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      const res = await fetch(path, { headers });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    function renderNav() {
+      nav.innerHTML = "";
+      views.forEach(name => {
+        const button = document.createElement("button");
+        button.textContent = name;
+        button.className = name === current ? "active" : "";
+        button.onclick = () => { current = name; render(); };
+        nav.appendChild(button);
+      });
+    }
+
+    async function render() {
+      renderNav();
+      if (current === "Dashboard") {
+        try {
+          const health = await api("/api/health");
+          const version = await api("/api/version");
+          document.querySelector("#status").textContent = health.status;
+          view.innerHTML = `<div class="grid">
+            <div class="metric"><span>Proxy</span><strong>${health.proxy.listen_addr}</strong></div>
+            <div class="metric"><span>MITM</span><strong>${health.proxy.mitm_enabled ? "enabled" : "disabled"}</strong></div>
+            <div class="metric"><span>Admin</span><strong>${health.admin.addr}</strong></div>
+            <div class="metric"><span>Version</span><strong>${version.version}</strong></div>
+          </div>`;
+        } catch (err) {
+          view.innerHTML = `<div class="panel">Unable to load dashboard: <code>${err.message}</code></div>`;
+        }
+        return;
+      }
+      if (current === "Audit Log") {
+        const entries = await api("/api/audit");
+        view.innerHTML = `<div class="panel"><h2>Audit Log</h2><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>${entries.map(e => `<tr><td>${e.created_at}</td><td>${e.actor}</td><td>${e.action}</td><td><code>${e.details ? JSON.stringify(e.details) : ""}</code></td></tr>`).join("")}</tbody></table></div>`;
+        return;
+      }
+      if (current === "Traffic") {
+        const flows = await api("/api/traffic");
+        view.innerHTML = `<div class="panel"><h2>Traffic</h2><div class="actions"><button class="secondary" onclick="clearTraffic()">Clear</button><a class="secondary" href="/api/traffic/export?token=${encodeURIComponent(token())}">Export JSON</a><a class="secondary" href="/api/traffic/export?format=har&token=${encodeURIComponent(token())}">Export HAR</a></div><table><thead><tr><th>Time</th><th>Method</th><th>Host</th><th>Status</th><th>MIME</th><th>Duration</th><th>Cache</th><th>URL</th></tr></thead><tbody>${flows.map(f => `<tr><td>${f.created_at || ""}</td><td>${f.method || ""}</td><td>${f.host || ""}</td><td>${f.status || ""}</td><td>${f.mime_type || ""}</td><td>${f.duration_ms !== undefined ? `${f.duration_ms} ms` : ""}</td><td>${f.cache_hit ? "hit" : ""}</td><td><button class="rowbutton" onclick="showTraffic('${f.id}')">${f.url || f.id}</button></td></tr>`).join("")}</tbody></table></div><div id="traffic-detail" class="panel"><h2>Request Detail</h2><p>Select a traffic row to inspect headers, query params, and cookies.</p></div>`;
+        return;
+      }
+      if (current === "Certificates") {
+        const ca = await api("/api/certificates/ca");
+        const leaf = await api("/api/certificates/leaf");
+        view.innerHTML = `<div class="grid">
+          <div class="metric"><span>Subject</span><strong>${ca.subject}</strong></div>
+          <div class="metric"><span>Expires</span><strong>${ca.expires_at}</strong></div>
+          <div class="metric"><span>Path</span><strong>${ca.path}</strong></div>
+        </div><div class="panel"><h2>Fingerprint</h2><code>${ca.fingerprint}</code><div class="actions"><a class="primary" href="/api/certificates/ca/download?token=${encodeURIComponent(token())}">Download CA certificate</a><button class="secondary" onclick="rotateCA()">Rotate CA</button></div><div class="actions"><input id="ca-cert-path" placeholder="cert path"><input id="ca-key-path" placeholder="key path"><button class="secondary" onclick="importCA()">Import CA</button></div></div>
+        <div class="panel"><h2>Trust Instructions</h2><table><tbody><tr><td>Windows</td><td>Import into Trusted Root Certification Authorities.</td></tr><tr><td>macOS</td><td>Import into Keychain Access and set Always Trust.</td></tr><tr><td>Linux</td><td>Install into the system CA store or browser-specific store.</td></tr><tr><td>Firefox</td><td>Import under Privacy & Security, Certificates, Authorities.</td></tr></tbody></table></div>
+        <div class="panel"><h2>Leaf Certificates</h2><table><thead><tr><th>Host</th><th>Subject</th><th>Expires</th><th>Fingerprint</th></tr></thead><tbody>${leaf.map(c => `<tr><td>${c.host}</td><td>${c.subject}</td><td>${c.expires_at}</td><td><code>${c.fingerprint}</code></td></tr>`).join("")}</tbody></table></div>`;
+        return;
+      }
+      if (current === "Blocks") {
+        const ports = await api("/api/blocks/ports");
+        const domains = await api("/api/blocks/domains");
+        const ips = await api("/api/blocks/ips");
+        view.innerHTML = `<div class="grid">
+          <div class="metric"><span>Ports</span><strong>${ports.length}</strong></div>
+          <div class="metric"><span>Domains</span><strong>${domains.length}</strong></div>
+          <div class="metric"><span>IPs</span><strong>${ips.length}</strong></div>
+        </div>
+        <div class="panel"><h2>Ports</h2><div class="actions"><input id="block-port" type="number" placeholder="25"><button class="secondary" onclick="addPort()">Add</button></div><table><tbody>${ports.map(p => `<tr><td>${p}</td><td><button class="rowbutton" onclick="deletePort(${p})">Delete</button></td></tr>`).join("")}</tbody></table></div>
+        <div class="panel"><h2>Domains</h2><div class="actions"><input id="block-domain" placeholder="*.tracking.example"><button class="secondary" onclick="addDomain()">Add</button></div><table><tbody>${domains.map(d => `<tr><td>${d}</td><td><button class="rowbutton" onclick="deleteDomain('${encodeURIComponent(d)}')">Delete</button></td></tr>`).join("")}</tbody></table></div>
+        <div class="panel"><h2>IPs</h2><div class="actions"><input id="block-ip" placeholder="203.0.113.0/24"><button class="secondary" onclick="addIP()">Add</button></div><table><tbody>${ips.map(ip => `<tr><td>${ip}</td><td><button class="rowbutton" onclick="deleteIP('${encodeURIComponent(ip)}')">Delete</button></td></tr>`).join("")}</tbody></table></div>
+        <div class="panel"><h2>Matcher Test</h2><div class="actions"><input id="test-host" placeholder="host"><input id="test-port" type="number" placeholder="443"><input id="test-ip" placeholder="IP"><button class="secondary" onclick="testBlock()">Test</button></div><pre id="block-test-result">{}</pre></div>`;
+        return;
+      }
+      if (current === "Deployments") {
+        const deployment = await api("/api/deployments/current");
+        const logs = await api("/api/logs");
+        const profiles = (deployment.profiles || []).map(p => `<tr><td>${p.name}</td><td>${p.kind}</td><td>${p.description}</td></tr>`).join("");
+        view.innerHTML = `<div class="grid">
+          <div class="metric"><span>Status</span><strong>${deployment.status}</strong></div>
+          <div class="metric"><span>Listen address</span><strong>${deployment.listen_addr}</strong></div>
+          <div class="metric"><span>MITM</span><strong>${deployment.mitm_enabled ? "enabled" : "disabled"}</strong></div>
+          <div class="metric"><span>Config</span><strong>${deployment.config_path || "defaults"}</strong></div>
+        </div><div class="panel"><h2>Controls</h2><div class="actions"><button class="secondary" onclick="reloadDeployment()">Reload config</button><button class="secondary" onclick="restartDeployment()">Restart</button></div></div><div class="panel"><h2>Logs</h2><pre>${logs.join("\n")}</pre></div><div class="panel"><h2>Profiles</h2><table><thead><tr><th>Name</th><th>Kind</th><th>Description</th></tr></thead><tbody>${profiles}</tbody></table></div>`;
+        return;
+      }
+      if (current === "Cache") {
+        const cache = await api("/api/cache");
+        view.innerHTML = `<div class="grid">
+          <div class="metric"><span>Enabled</span><strong>${cache.enabled ? "yes" : "no"}</strong></div>
+          <div class="metric"><span>Directory</span><strong>${cache.directory}</strong></div>
+          <div class="metric"><span>TTL</span><strong>${cache.ttl}s</strong></div>
+          <div class="metric"><span>Entries</span><strong>${cache.entries}</strong></div>
+          <div class="metric"><span>Hit rate</span><strong>${cache.hits || 0}/${(cache.hits || 0) + (cache.misses || 0)}</strong></div>
+          <div class="metric"><span>Size</span><strong>${cache.size} bytes</strong></div>
+        </div><div class="panel"><h2>Purge</h2><div class="actions"><input id="cache-domain" placeholder="optional domain"><button class="secondary" onclick="purgeCache()">Purge</button></div></div>
+        <div class="panel"><h2>Cached Entries</h2><table><thead><tr><th>URL</th><th>Status</th><th>Expires</th><th>Size</th></tr></thead><tbody>${(cache.items || []).map(i => `<tr><td>${i.url}</td><td>${i.status}</td><td>${i.expires_at}</td><td>${i.size || 0}</td></tr>`).join("")}</tbody></table></div>`;
+        return;
+      }
+      if (current === "Settings") {
+        const settings = await api("/api/settings");
+        view.innerHTML = `<div class="panel"><h2>Settings</h2>
+          <div class="actions"><button class="secondary" onclick="saveSettings()">Save</button></div>
+          <label><input id="set-mitm" type="checkbox" ${settings.enable_mitm ? "checked" : ""}> Enable MITM</label><br>
+          <label><input id="set-verbose" type="checkbox" ${settings.verbose_logging ? "checked" : ""}> Verbose logging</label><br>
+          <label><input id="set-requests" type="checkbox" ${settings.log_requests ? "checked" : ""}> Request logging</label><br>
+          <p>TLS minimum <input id="set-tls" value="${settings.min_tls_version || ""}"></p>
+          <p>Idle timeout <input id="set-idle" type="number" value="${settings.idle_timeout_seconds || 0}"></p>
+          <h3>Traffic Capture</h3>
+          <label><input id="set-store-bodies" type="checkbox" ${settings.traffic_capture && settings.traffic_capture.store_bodies ? "checked" : ""}> Store body samples</label><br>
+          <label><input id="set-redact-bodies" type="checkbox" ${!settings.traffic_capture || settings.traffic_capture.redact_bodies ? "checked" : ""}> Redact body samples</label>
+          <p>Max body bytes <input id="set-body-max" type="number" value="${settings.traffic_capture ? settings.traffic_capture.max_body_bytes : 32768}"></p>
+          <h3>Excluded Domains</h3><textarea id="set-excluded" style="width:100%;min-height:80px">${(settings.excluded_domains || []).join("\n")}</textarea>
+          <h3>Cache</h3><pre>${JSON.stringify(settings.cache, null, 2)}</pre></div>`;
+        return;
+      }
+      if (current === "Admin Users") {
+        const users = await api("/api/admin/users");
+        view.innerHTML = `<div class="panel"><h2>Admin Users</h2>
+          <div class="actions"><input id="admin-user-name" placeholder="name"><select id="admin-user-role"><option value="read">Read only</option><option value="admin">Admin</option></select><button class="secondary" onclick="addAdminUser()">Add</button></div>
+          <table><thead><tr><th>Name</th><th>Role</th><th>Created</th><th></th></tr></thead><tbody>${users.map(u => `<tr><td>${u.name}</td><td><span class="badge ${u.role === "admin" ? "warn" : "allow"}">${u.role}</span></td><td>${u.created_at}</td><td><button class="rowbutton" onclick="deleteAdminUser(${u.id})">Delete</button></td></tr>`).join("")}</tbody></table>
+          <p>Bearer tokens still enforce API access; this list records named dashboard users and roles for audit and operations.</p></div>`;
+        return;
+      }
+      if (current === "Threat Scanner") {
+        const data = await api("/api/threats/events");
+        const m = data.metrics;
+        const topRules = (m.top_rules || []).map(r => `<tr><td><code>${r.id}</code></td><td>${r.name}</td><td>${r.hits}</td><td>${r.false_positive_overrides}</td></tr>`).join("");
+        view.innerHTML = `<div class="grid">
+          <div class="metric"><span>Scanned requests</span><strong>${m.scanned_requests}</strong></div>
+          <div class="metric"><span>Scanned responses</span><strong>${m.scanned_responses}</strong></div>
+          <div class="metric"><span>Warnings</span><strong>${m.warnings}</strong></div>
+          <div class="metric"><span>Blocked threats</span><strong>${m.blocked_threats}</strong></div>
+          <div class="metric"><span>Quarantine</span><strong>${m.quarantined}</strong></div>
+          <div class="metric"><span>AI calls</span><strong>${m.ai_calls}</strong></div>
+          <div class="metric"><span>Average latency</span><strong>${Number(m.average_scan_latency_ms).toFixed(1)} ms</strong></div>
+          <div class="metric"><span>Timeouts</span><strong>${m.timeouts}</strong></div>
+        </div>
+        <div class="panel"><h2>Live Detections</h2><table><thead><tr><th>Time</th><th>Target</th><th>Host</th><th>Action</th><th>Score</th><th>AI</th><th>Reason</th></tr></thead><tbody>${data.events.map(e => `<tr><td>${e.timestamp}</td><td>${e.target}</td><td>${e.host || ""}</td><td><span class="badge ${e.verdict.action}">${e.verdict.action}</span></td><td>${e.local_result ? e.local_result.score : ""}</td><td>${e.ai_used ? "yes" : "no"}</td><td><button class="rowbutton" onclick="showThreat('${e.id}')">${e.verdict.reason}</button></td></tr>`).join("")}</tbody></table></div>
+        <div class="panel"><h2>Top Rules</h2><table><thead><tr><th>ID</th><th>Name</th><th>Hits</th><th>False positives</th></tr></thead><tbody>${topRules}</tbody></table></div>
+        <div id="threat-detail" class="panel"><h2>Detection Detail</h2><p>Select a detection reason to inspect signals, AI output, and redaction details.</p></div>`;
+        return;
+      }
+      view.innerHTML = `<div class="panel"><h2>${current}</h2></div>`;
+    }
+
+    async function post(path) {
+      const headers = {};
+      const t = token();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      const res = await fetch(path, { method: "POST", headers });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    async function postJSON(path, body) {
+      const headers = { "Content-Type": "application/json" };
+      const t = token();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      const res = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    async function put(path, body) {
+      const headers = { "Content-Type": "application/json" };
+      const t = token();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      const res = await fetch(path, { method: "PUT", headers, body: JSON.stringify(body) });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    async function saveSettings() {
+      await put("/api/settings", {
+        enable_mitm: document.querySelector("#set-mitm").checked,
+        verbose_logging: document.querySelector("#set-verbose").checked,
+        log_requests: document.querySelector("#set-requests").checked,
+        min_tls_version: document.querySelector("#set-tls").value,
+        idle_timeout_seconds: Number(document.querySelector("#set-idle").value),
+        traffic_capture: {
+          store_bodies: document.querySelector("#set-store-bodies").checked,
+          redact_bodies: document.querySelector("#set-redact-bodies").checked,
+          max_body_bytes: Number(document.querySelector("#set-body-max").value)
+        },
+        excluded_domains: document.querySelector("#set-excluded").value.split("\n").map(s => s.trim()).filter(Boolean)
+      });
+      await render();
+    }
+
+    async function reloadDeployment() {
+      await post("/api/deployments/current/reload");
+      await render();
+    }
+
+    async function restartDeployment() {
+      await post("/api/deployments/current/restart");
+      await render();
+    }
+
+    async function del(path) {
+      const headers = {};
+      const t = token();
+      if (t) headers.Authorization = `Bearer ${t}`;
+      const res = await fetch(path, { method: "DELETE", headers });
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return res.json();
+    }
+
+    async function clearTraffic() {
+      await del("/api/traffic");
+      await render();
+    }
+
+    async function rotateCA() {
+      await post("/api/certificates/ca/rotate");
+      await render();
+    }
+
+    async function importCA() {
+      await postJSON("/api/certificates/ca/import", {
+        cert_path: document.querySelector("#ca-cert-path").value,
+        key_path: document.querySelector("#ca-key-path").value
+      });
+      await render();
+    }
+
+    async function addPort() {
+      await postJSON("/api/blocks/ports", { port: Number(document.querySelector("#block-port").value) });
+      await render();
+    }
+
+    async function deletePort(port) {
+      await del(`/api/blocks/ports/${port}`);
+      await render();
+    }
+
+    async function addDomain() {
+      await postJSON("/api/blocks/domains", { pattern: document.querySelector("#block-domain").value });
+      await render();
+    }
+
+    async function deleteDomain(domain) {
+      await del(`/api/blocks/domains/${domain}`);
+      await render();
+    }
+
+    async function addIP() {
+      await postJSON("/api/blocks/ips", { pattern: document.querySelector("#block-ip").value });
+      await render();
+    }
+
+    async function deleteIP(ip) {
+      await del(`/api/blocks/ips/${ip}`);
+      await render();
+    }
+
+    async function testBlock() {
+      const result = await postJSON("/api/blocks/test", {
+        host: document.querySelector("#test-host").value,
+        port: Number(document.querySelector("#test-port").value),
+        ip: document.querySelector("#test-ip").value
+      });
+      document.querySelector("#block-test-result").textContent = JSON.stringify(result, null, 2);
+    }
+
+    async function purgeCache() {
+      await postJSON("/api/cache/purge", { domain: document.querySelector("#cache-domain").value });
+      await render();
+    }
+
+    async function addAdminUser() {
+      await postJSON("/api/admin/users", {
+        name: document.querySelector("#admin-user-name").value,
+        role: document.querySelector("#admin-user-role").value
+      });
+      await render();
+    }
+
+    async function deleteAdminUser(id) {
+      await del(`/api/admin/users/${id}`);
+      await render();
+    }
+
+    async function showTraffic(id) {
+      const flow = await api(`/api/traffic/${id}`);
+      const reqHeaders = (flow.headers || []).filter(h => h.direction === "request").map(h => `<tr><td>${h.name}</td><td><code>${h.value}</code></td></tr>`).join("");
+      const respHeaders = (flow.headers || []).filter(h => h.direction === "response").map(h => `<tr><td>${h.name}</td><td><code>${h.value}</code></td></tr>`).join("");
+      const detail = document.querySelector("#traffic-detail");
+      detail.innerHTML = `<h2>Request Detail</h2>
+        <div class="actions"><button class="secondary" onclick="replayTraffic('${id}')">Replay</button></div>
+        <div class="grid">
+          <div class="metric"><span>Method</span><strong>${flow.method || ""}</strong></div>
+          <div class="metric"><span>Status</span><strong>${flow.status || ""}</strong></div>
+          <div class="metric"><span>Duration</span><strong>${flow.duration_ms || 0} ms</strong></div>
+          <div class="metric"><span>Cache</span><strong>${flow.cache_hit ? "hit" : "miss"}</strong></div>
+        </div>
+        <h3>URL</h3><pre>${flow.url || ""}</pre>
+        <h3>Query Params</h3><pre>${JSON.stringify(flow.query_params || {}, null, 2)}</pre>
+        <h3>Cookies</h3><pre>${JSON.stringify(flow.cookies || {}, null, 2)}</pre>
+        <h3>Request Headers</h3><table><tbody>${reqHeaders}</tbody></table>
+        <h3>Response Headers</h3><table><tbody>${respHeaders}</tbody></table>
+        <h3>Request Body Sample</h3><pre>${flow.request_body || ""}</pre>
+        <h3>Response Body Sample</h3><pre>${flow.response_body || ""}</pre>`;
+    }
+
+    async function replayTraffic(id) {
+      const result = await post(`/api/traffic/${id}/replay`);
+      document.querySelector("#traffic-detail").insertAdjacentHTML("beforeend", `<h3>Replay Result</h3><pre>${JSON.stringify(result, null, 2)}</pre>`);
+    }
+
+    async function showThreat(id) {
+      const e = await api(`/api/threats/events/${id}`);
+      const signals = ((e.local_result && e.local_result.signals) || []).map(s => `<tr><td><code>${s.id}</code></td><td>${s.name}</td><td>${s.category}</td><td>${s.severity}</td><td>${s.weight}</td><td><code>${JSON.stringify(s.evidence || {})}</code></td></tr>`).join("");
+      const detail = document.querySelector("#threat-detail");
+      detail.innerHTML = `<h2>Detection Detail</h2>
+        <div class="actions">
+          <button class="secondary" onclick="overrideThreat('${id}', 'false-positive')">Mark false positive</button>
+          <button class="secondary" onclick="overrideThreat('${id}', 'allow')">Allow</button>
+          <button class="secondary" onclick="overrideThreat('${id}', 'block')">Block</button>
+          <button class="secondary" onclick="overrideThreat('${id}', 'quarantine')">Quarantine</button>
+        </div>
+        <div class="grid">
+          <div class="metric"><span>Final action</span><strong>${e.verdict.action}</strong></div>
+          <div class="metric"><span>Local score</span><strong>${e.local_result.score}</strong></div>
+          <div class="metric"><span>AI used</span><strong>${e.ai_used ? "yes" : "no"}</strong></div>
+          <div class="metric"><span>Latency</span><strong>${e.scan_latency_ms} ms</strong></div>
+        </div>
+        <h3>Signals</h3><table><thead><tr><th>ID</th><th>Name</th><th>Category</th><th>Severity</th><th>Weight</th><th>Evidence</th></tr></thead><tbody>${signals}</tbody></table>
+        <h3>AI Verdict</h3><pre>${JSON.stringify(e.ai_verdict || {}, null, 2)}</pre>
+        <h3>Redaction</h3><pre>${JSON.stringify((e.evidence && e.evidence.redaction) || {}, null, 2)}</pre>
+        <h3>Quarantine</h3><pre>${JSON.stringify((e.evidence && e.evidence.quarantine) || {}, null, 2)}</pre>`;
+    }
+
+    async function overrideThreat(id, action) {
+      await post(`/api/threats/events/${id}/${action}`);
+      await render();
+    }
+
+    if (localStorage.getItem("responsibleUseConfirmed") !== "true") {
+      const dialog = document.querySelector("#consent");
+      dialog.showModal();
+      document.querySelector("#accept").onclick = () => {
+        localStorage.setItem("responsibleUseConfirmed", "true");
+        dialog.close();
+      };
+    }
+    render();
+  </script>
+</body>
+</html>

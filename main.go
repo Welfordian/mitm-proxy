@@ -1,19 +1,26 @@
 package main
 
 import (
+	"context"
+	"encoding/json"
 	"flag"
+	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"time"
 
+	adminpkg "mitm-proxy/internal/admin"
 	capkg "mitm-proxy/internal/ca"
 	cfgpkg "mitm-proxy/internal/config"
+	"mitm-proxy/internal/events"
 	proxypkg "mitm-proxy/internal/proxy"
+	"mitm-proxy/internal/store"
 )
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.Lmicroseconds)
+	startedAt := time.Now()
 
 	// Command-line flags
 	configPath := flag.String("config", "", "Path to config.json file")
@@ -22,6 +29,12 @@ func main() {
 	caKeyPath := flag.String("ca-key", "", "Path to existing CA key (overrides config)")
 	enableMITM := flag.Bool("mitm", true, "Enable MITM interception (overrides config)")
 	verbose := flag.Bool("verbose", false, "Enable verbose logging (overrides config)")
+	adminEnabled := flag.Bool("admin-enabled", true, "Enable local admin API/dashboard")
+	adminAddr := flag.String("admin-addr", "127.0.0.1:9090", "Admin API/dashboard listen address")
+	adminToken := flag.String("admin-token", "", "Admin bearer token (generated when admin is enabled and token is empty)")
+	adminReadToken := flag.String("admin-read-token", "", "Read-only admin bearer token")
+	adminUI := flag.Bool("admin-ui", true, "Serve embedded admin UI")
+	adminStore := flag.String("admin-store", "dashboard.db", "Admin SQLite store path")
 
 	// Default for --watch-config is centralized here for easy future changes
 	const defaultWatchConfig = true
@@ -29,6 +42,10 @@ func main() {
 	watchConfig := flag.Bool("watch-config", defaultWatchConfig, "Watch config.json for changes and auto-apply (default true)")
 
 	flag.Parse()
+	setFlags := map[string]bool{}
+	flag.Visit(func(f *flag.Flag) {
+		setFlags[f.Name] = true
+	})
 
 	// Load configuration
 	config, err := cfgpkg.Load(*configPath)
@@ -84,7 +101,158 @@ func main() {
 
 	log.Printf("Starting proxy (HTTP + HTTPS, HTTP/1.1 + HTTP/2, ws + wss)")
 
-	proxy := proxypkg.New(ca, config)
+	eventBus := events.NewBus(256)
+	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
+
+	if setFlags["admin-enabled"] {
+		config.AdminEnabled = *adminEnabled
+	}
+	if setFlags["admin-addr"] {
+		config.AdminAddr = *adminAddr
+	}
+	if setFlags["admin-token"] {
+		config.AdminToken = *adminToken
+	}
+	if setFlags["admin-read-token"] {
+		config.AdminReadToken = *adminReadToken
+	}
+	if setFlags["admin-ui"] {
+		config.AdminUI = *adminUI
+	}
+	if setFlags["admin-store"] {
+		config.AdminStore = *adminStore
+	}
+
+	if config.AdminEnabled {
+		token := config.AdminToken
+		generatedAuth := false
+		if token == "" {
+			var err error
+			token, err = adminpkg.GenerateToken()
+			if err != nil {
+				log.Fatalf("failed to generate admin token: %v", err)
+			}
+			generatedAuth = true
+		}
+		config.AdminToken = token
+
+		auditStore, err := store.Open(config.AdminStore)
+		if err != nil {
+			log.Fatalf("failed to open admin store: %v", err)
+		}
+
+		adminServer := adminpkg.New(adminpkg.Options{
+			Addr:          config.AdminAddr,
+			Token:         token,
+			ReadToken:     config.AdminReadToken,
+			UIEnabled:     config.AdminUI,
+			Store:         auditStore,
+			Config:        proxy.CurrentConfig,
+			ConfigPath:    cfgPathForDisplay(*configPath),
+			ProxyVersion:  "dev",
+			ProxyStarted:  startedAt,
+			GeneratedAuth: generatedAuth,
+			ThreatScanner: proxy.ThreatScanner(),
+			EventBus:      eventBus,
+			SaveConfig: func(_ context.Context, cfg *cfgpkg.Config) error {
+				path := cfgPathForWrite(*configPath)
+				toWrite := *cfg
+				if generatedAuth {
+					toWrite.AdminToken = ""
+				}
+				data, err := json.MarshalIndent(toWrite, "", "  ")
+				if err != nil {
+					return fmt.Errorf("marshal config: %w", err)
+				}
+				data = append(data, '\n')
+				if err := os.WriteFile(path, data, 0600); err != nil {
+					return fmt.Errorf("write config %s: %w", path, err)
+				}
+				eventBus.Publish(events.Event{
+					Topic: events.TopicConfigUpdated,
+					Time:  time.Now().UTC(),
+					Payload: map[string]any{
+						"path":   path,
+						"source": "admin.settings.persist",
+					},
+				})
+				return nil
+			},
+			ReloadConfig: func(ctx context.Context) error {
+				path := cfgPathForDisplay(*configPath)
+				if path == "" {
+					return fmt.Errorf("no config file is available to reload")
+				}
+				newCfg, err := cfgpkg.Load(path)
+				if err != nil {
+					return err
+				}
+				applyCLIOverrides(newCfg, *listenAddr, *caCertPath, *caKeyPath, *enableMITM, *verbose)
+				if setFlags["admin-enabled"] {
+					newCfg.AdminEnabled = *adminEnabled
+				}
+				if setFlags["admin-addr"] {
+					newCfg.AdminAddr = *adminAddr
+				}
+				newCfg.AdminToken = token
+				if setFlags["admin-read-token"] {
+					newCfg.AdminReadToken = *adminReadToken
+				}
+				if setFlags["admin-ui"] {
+					newCfg.AdminUI = *adminUI
+				}
+				if setFlags["admin-store"] {
+					newCfg.AdminStore = *adminStore
+				}
+				proxy.SetConfig(newCfg)
+				eventBus.Publish(events.Event{
+					Topic: events.TopicConfigUpdated,
+					Time:  time.Now().UTC(),
+					Payload: map[string]any{
+						"path": path,
+					},
+				})
+				return nil
+			},
+			RotateCA: func(ctx context.Context) error {
+				newCA, err := capkg.Rotate(proxy.CurrentConfig())
+				if err != nil {
+					return err
+				}
+				proxy.SetCA(newCA)
+				eventBus.Publish(events.Event{
+					Topic: events.TopicCertGenerated,
+					Time:  time.Now().UTC(),
+					Payload: map[string]any{
+						"host": "CA",
+					},
+				})
+				return nil
+			},
+			ImportCA: func(ctx context.Context, certPath, keyPath string) error {
+				newCA, err := capkg.LoadFromFiles(certPath, keyPath)
+				if err != nil {
+					return err
+				}
+				cfg := proxy.CurrentConfig()
+				cfg.CACertPath = certPath
+				cfg.CAKeyPath = keyPath
+				proxy.SetCA(newCA)
+				return nil
+			},
+			PublishEvent: eventBus.Publish,
+		})
+
+		go func() {
+			log.Printf("Admin API/dashboard listening on http://%s/admin/", config.AdminAddr)
+			if generatedAuth {
+				log.Printf("Generated admin token: %s", token)
+			}
+			if err := adminServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
+				log.Printf("admin server error: %v", err)
+			}
+		}()
+	}
 
 	// Determine path to watch (do not honor any watch-related config from config.json)
 	var cfgPathToWatch string
@@ -147,6 +315,13 @@ func main() {
 						}
 
 						proxy.SetConfig(newCfg)
+						eventBus.Publish(events.Event{
+							Topic: events.TopicConfigUpdated,
+							Time:  time.Now().UTC(),
+							Payload: map[string]any{
+								"path": path,
+							},
+						})
 						log.Printf("Applied updated configuration from %s", path)
 					}
 				}
@@ -161,5 +336,40 @@ func main() {
 
 	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("ListenAndServe: %v", err)
+	}
+}
+
+func cfgPathForDisplay(configPath string) string {
+	if configPath != "" {
+		return configPath
+	}
+	if _, err := os.Stat("config.json"); err == nil {
+		return "config.json"
+	}
+	return ""
+}
+
+func cfgPathForWrite(configPath string) string {
+	if configPath != "" {
+		return configPath
+	}
+	return "config.json"
+}
+
+func applyCLIOverrides(config *cfgpkg.Config, listenAddr, caCertPath, caKeyPath string, enableMITM, verbose bool) {
+	if listenAddr != "" {
+		config.ListenAddr = listenAddr
+	}
+	if caCertPath != "" {
+		config.CACertPath = caCertPath
+	}
+	if caKeyPath != "" {
+		config.CAKeyPath = caKeyPath
+	}
+	if !enableMITM {
+		config.EnableMITM = false
+	}
+	if verbose {
+		config.VerboseLogging = true
 	}
 }

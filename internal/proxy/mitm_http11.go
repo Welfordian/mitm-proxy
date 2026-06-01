@@ -10,6 +10,8 @@ import (
 	"net/http"
 	"strings"
 	"time"
+
+	"mitm-proxy/internal/events"
 )
 
 // mitmHTTPS11 handles HTTPS traffic where ALPN negotiated HTTP/1.1.
@@ -42,6 +44,8 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 		}
 
 		start := time.Now()
+		requestID := requestID(start)
+		req = withTrafficID(req, requestID)
 
 		req.RequestURI = ""
 
@@ -58,10 +62,35 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 		}
 
 		stripHopByHopHeaders(req.Header)
+		p.publishTrafficStarted(requestID, req, "https/1.1")
+
+		if decision := p.checkPolicy(req.URL.Host); decision.Blocked {
+			p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
+			blocked := threatBlockedResponse(threatsFromPolicy(decision))
+			_ = blocked.Write(clientTLS)
+			continue
+		}
+
+		verdict, scanErr := p.scanRequest(req.Context(), req)
+		if p.shouldBlock(verdict, scanErr) {
+			blocked := threatBlockedResponse(verdict)
+			_ = blocked.Write(clientTLS)
+			continue
+		}
+		p.prepareRequestForThreatResponseScan(req)
 
 		// Try cache for GET
 		if p.cache != nil && p.cache.ShouldConsider(req) {
 			if cr, hashHex, err := p.cache.Load(req.URL); err == nil && cr != nil {
+				p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
+				cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone()}
+				verdict, scanErr := p.scanBufferedResponse(req.Context(), req, cachedResp, cr.Body)
+				if p.shouldBlock(verdict, scanErr) {
+					blocked := threatBlockedResponse(verdict)
+					_ = blocked.Write(clientTLS)
+					continue
+				}
+
 				// write cached response directly to TLS conn
 				hdr := make(http.Header)
 
@@ -82,9 +111,11 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 				_ = cached.Write(clientTLS)
 
 				p.logRequest("CACHE HIT HTTPS/1.1 %s %s -> status=%d, dur=%s", req.Method, req.URL.String(), cr.Status, time.Since(start))
+				p.publishTrafficCompleted(requestID, req, cr.Status, len(cr.Body), time.Since(start), true, cr.Header)
 
 				continue
 			}
+			p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 		}
 
 		resp, err := p.client.Do(req)
@@ -102,6 +133,13 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 			resp.Body.Close()
 			stripHopByHopHeaders(resp.Header)
 
+			verdict, scanErr := p.scanBufferedResponse(req.Context(), req, resp, body)
+			if p.shouldBlock(verdict, scanErr) {
+				blocked := threatBlockedResponse(verdict)
+				_ = blocked.Write(clientTLS)
+				continue
+			}
+
 			// Construct response to write
 			out := &http.Response{StatusCode: resp.StatusCode, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: resp.Header.Clone(), Body: io.NopCloser(bytes.NewReader(body))}
 
@@ -115,10 +153,18 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 			p.cache.Save(req.URL, resp, body)
 
 			p.logRequest("HTTPS/1.1 %s %s -> status=%d, dur=%s (cached)", req.Method, req.URL.String(), resp.StatusCode, time.Since(start))
+			p.publishTrafficCompleted(requestID, req, resp.StatusCode, len(body), time.Since(start), false, resp.Header)
 		} else {
 			p.logRequest("HTTPS/1.1 %s %s -> status=%d, dur=%s", req.Method, req.URL.String(), resp.StatusCode, time.Since(start))
 
 			stripHopByHopHeaders(resp.Header)
+			verdict, scanErr = p.prepareResponseForScan(req.Context(), req, resp)
+			if p.shouldBlock(verdict, scanErr) {
+				resp.Body.Close()
+				blocked := threatBlockedResponse(verdict)
+				_ = blocked.Write(clientTLS)
+				continue
+			}
 			err = resp.Write(clientTLS)
 			resp.Body.Close()
 
@@ -129,6 +175,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 
 				return
 			}
+			p.publishTrafficCompleted(requestID, req, resp.StatusCode, -1, time.Since(start), false, resp.Header)
 		}
 	}
 }
@@ -220,6 +267,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 	}
 
 	p.logVerbose("wss tunnel established %s <-> %s", clientTLS.RemoteAddr(), targetHost)
+	p.publishTunnelOpened(targetHost, "wss", clientTLS.RemoteAddr().String())
 
 	go func() {
 		defer clientTLS.Close()

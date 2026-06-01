@@ -45,8 +45,29 @@ type Config struct {
 	// Proxy identity
 	ProxyName string `json:"proxy_name"`
 
+	// Admin dashboard
+	AdminEnabled   bool   `json:"admin_enabled"`
+	AdminAddr      string `json:"admin_addr"`
+	AdminToken     string `json:"admin_token"`
+	AdminReadToken string `json:"admin_read_token"`
+	AdminUI        bool   `json:"admin_ui"`
+	AdminStore     string `json:"admin_store"`
+
 	// Caching (nested)
 	Cache CacheConfig `json:"cache"`
+
+	// Blocking policy
+	BlockedPorts        []int    `json:"blocked_ports"`
+	BlockedDomains      []string `json:"blocked_domains"`
+	BlockedIPs          []string `json:"blocked_ips"`
+	BlockAction         string   `json:"block_action"`
+	BlockResponseStatus int      `json:"block_response_status"`
+
+	// Threat scanning
+	ThreatScanner ThreatScannerConfig `json:"threat_scanner"`
+
+	// Traffic capture controls body persistence for dashboard inspection.
+	TrafficCapture TrafficCaptureConfig `json:"traffic_capture"`
 
 	// Deprecated legacy flat caching fields (supported for backward compatibility)
 	CacheEnabledLegacy      bool     `json:"cache_enabled"`
@@ -69,6 +90,43 @@ type CacheConfig struct {
 	TTL               int      `json:"ttl"`
 }
 
+// ThreatScannerConfig holds threat-scanning and AI classifier settings.
+type ThreatScannerConfig struct {
+	Enabled                  bool     `json:"enabled"`
+	Mode                     string   `json:"mode"`
+	Provider                 string   `json:"provider"`
+	Model                    string   `json:"model"`
+	SecondOpinionModel       string   `json:"second_opinion_model"`
+	ScanRequests             bool     `json:"scan_requests"`
+	ScanResponses            bool     `json:"scan_responses"`
+	MaxBodyBytes             int64    `json:"max_body_bytes"`
+	MaxAIBodyBytes           int64    `json:"max_ai_body_bytes"`
+	AITimeoutMS              int      `json:"ai_timeout_ms"`
+	BlockThreshold           float64  `json:"block_threshold"`
+	WarnThreshold            float64  `json:"warn_threshold"`
+	RequireAIConfirm         bool     `json:"require_ai_confirmation_for_block"`
+	BlockCriticalOnAIFailure bool     `json:"block_critical_local_on_ai_failure"`
+	FailOpen                 bool     `json:"fail_open"`
+	ScanContentTypes         []string `json:"scan_content_types"`
+	SkipContentTypes         []string `json:"skip_content_types"`
+	TrustedDomains           []string `json:"trusted_domains"`
+	AllowlistDomains         []string `json:"allowlist_domains"`
+	MaliciousDomains         []string `json:"malicious_domains"`
+	MaliciousFileHashes      []string `json:"malicious_file_hashes"`
+	ThreatIntelUpdated       string   `json:"threat_intel_updated"`
+	QuarantineDir            string   `json:"quarantine_dir"`
+	DebugLogPath             string   `json:"debug_log_path"`
+	RedactBeforeAI           bool     `json:"redact_before_ai"`
+	StoreBodies              bool     `json:"store_bodies"`
+	OpenAIAPIKeyEnv          string   `json:"openai_api_key_env"`
+}
+
+type TrafficCaptureConfig struct {
+	StoreBodies  bool  `json:"store_bodies"`
+	MaxBodyBytes int64 `json:"max_body_bytes"`
+	RedactBodies bool  `json:"redact_bodies"`
+}
+
 // defaultConfig returns a Config with sensible defaults.
 func defaultConfig() *Config {
 	return &Config{
@@ -87,12 +145,72 @@ func defaultConfig() *Config {
 		MinTLSVersion:       "1.2",
 		TLSNextProtos:       []string{"h2", "http/1.1"},
 		ProxyName:           "MITM-Proxy",
+		AdminEnabled:        true,
+		AdminAddr:           "127.0.0.1:9090",
+		AdminUI:             true,
+		AdminStore:          "dashboard.db",
+		BlockAction:         "deny",
+		BlockResponseStatus: 403,
 		// Caching defaults
 		Cache: CacheConfig{
 			Enabled:   false,
 			Directory: "cache",
 			TTL:       3600,
 		},
+		ThreatScanner: defaultThreatScannerConfig(),
+		TrafficCapture: TrafficCaptureConfig{
+			StoreBodies:  false,
+			MaxBodyBytes: 32768,
+			RedactBodies: true,
+		},
+	}
+}
+
+func defaultThreatScannerConfig() ThreatScannerConfig {
+	return ThreatScannerConfig{
+		Enabled:                  false,
+		Mode:                     "suspicious_only",
+		Provider:                 "openai",
+		Model:                    "gpt-5.4-nano",
+		SecondOpinionModel:       "gpt-5.4-mini",
+		ScanRequests:             true,
+		ScanResponses:            true,
+		MaxBodyBytes:             131072,
+		MaxAIBodyBytes:           32768,
+		AITimeoutMS:              5000,
+		BlockThreshold:           0.85,
+		WarnThreshold:            0.65,
+		RequireAIConfirm:         true,
+		BlockCriticalOnAIFailure: true,
+		FailOpen:                 true,
+		ScanContentTypes: []string{
+			"text/html",
+			"text/plain",
+			"application/json",
+			"application/javascript",
+			"text/javascript",
+			"application/xml",
+		},
+		SkipContentTypes: []string{
+			"image/",
+			"video/",
+			"audio/",
+			"font/",
+			"application/octet-stream",
+		},
+		TrustedDomains: []string{
+			"localhost",
+			"127.0.0.1",
+			"::1",
+			"accounts.google.com",
+			"login.microsoftonline.com",
+			"github.com",
+		},
+		QuarantineDir:   "quarantine",
+		DebugLogPath:    "threats.log",
+		RedactBeforeAI:  true,
+		StoreBodies:     false,
+		OpenAIAPIKeyEnv: "OPENAI_API_KEY",
 	}
 }
 
@@ -134,6 +252,25 @@ func Load(path string) (*Config, error) {
 		cfg.Cache.TTL = 3600
 	}
 
+	applyThreatScannerDefaults(&cfg.ThreatScanner)
+	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
+
+	if strings.TrimSpace(cfg.AdminAddr) == "" {
+		cfg.AdminAddr = "127.0.0.1:9090"
+	}
+
+	if strings.TrimSpace(cfg.AdminStore) == "" {
+		cfg.AdminStore = "dashboard.db"
+	}
+
+	if cfg.BlockAction == "" {
+		cfg.BlockAction = "deny"
+	}
+
+	if cfg.BlockResponseStatus == 0 {
+		cfg.BlockResponseStatus = 403
+	}
+
 	// Default proxy name if missing
 	if strings.TrimSpace(cfg.ProxyName) == "" {
 		cfg.ProxyName = "MITM-Proxy"
@@ -151,6 +288,64 @@ func Load(path string) (*Config, error) {
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+func applyTrafficCaptureDefaults(c *TrafficCaptureConfig) {
+	if c.MaxBodyBytes == 0 {
+		c.MaxBodyBytes = 32768
+	}
+	if !c.StoreBodies {
+		c.RedactBodies = true
+	}
+}
+
+func applyThreatScannerDefaults(c *ThreatScannerConfig) {
+	defaults := defaultThreatScannerConfig()
+	if c.Mode == "" {
+		c.Mode = defaults.Mode
+	}
+	if c.Provider == "" {
+		c.Provider = defaults.Provider
+	}
+	if c.Model == "" {
+		c.Model = defaults.Model
+	}
+	if c.SecondOpinionModel == "" {
+		c.SecondOpinionModel = defaults.SecondOpinionModel
+	}
+	if c.MaxBodyBytes == 0 {
+		c.MaxBodyBytes = defaults.MaxBodyBytes
+	}
+	if c.MaxAIBodyBytes == 0 {
+		c.MaxAIBodyBytes = defaults.MaxAIBodyBytes
+	}
+	if c.AITimeoutMS == 0 {
+		c.AITimeoutMS = defaults.AITimeoutMS
+	}
+	if c.BlockThreshold == 0 {
+		c.BlockThreshold = defaults.BlockThreshold
+	}
+	if c.WarnThreshold == 0 {
+		c.WarnThreshold = defaults.WarnThreshold
+	}
+	if len(c.ScanContentTypes) == 0 {
+		c.ScanContentTypes = defaults.ScanContentTypes
+	}
+	if len(c.SkipContentTypes) == 0 {
+		c.SkipContentTypes = defaults.SkipContentTypes
+	}
+	if len(c.TrustedDomains) == 0 {
+		c.TrustedDomains = defaults.TrustedDomains
+	}
+	if c.QuarantineDir == "" {
+		c.QuarantineDir = defaults.QuarantineDir
+	}
+	if c.DebugLogPath == "" {
+		c.DebugLogPath = defaults.DebugLogPath
+	}
+	if c.OpenAIAPIKeyEnv == "" {
+		c.OpenAIAPIKeyEnv = defaults.OpenAIAPIKeyEnv
+	}
 }
 
 // isZeroCache reports whether all fields of CacheConfig are zero-values

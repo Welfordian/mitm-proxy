@@ -7,6 +7,8 @@ import (
 	"time"
 
 	"golang.org/x/net/http2"
+
+	"mitm-proxy/internal/events"
 )
 
 // mitmHTTPS2 handles HTTPS traffic where ALPN negotiated HTTP/2.
@@ -17,8 +19,10 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		start := time.Now()
+		requestID := requestID(start)
 
 		req := r.Clone(r.Context())
+		req = withTrafficID(req, requestID)
 		req.RequestURI = ""
 
 		if req.URL.Scheme == "" {
@@ -34,10 +38,32 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 		}
 
 		stripHopByHopHeaders(req.Header)
+		p.publishTrafficStarted(requestID, req, "https/2")
+
+		if decision := p.checkPolicy(req.URL.Host); decision.Blocked {
+			p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
+			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, threatsFromPolicy(decision))
+			return
+		}
+
+		verdict, scanErr := p.scanRequest(r.Context(), req)
+		if p.shouldBlock(verdict, scanErr) {
+			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
+			return
+		}
+		p.prepareRequestForThreatResponseScan(req)
 
 		// Try cache for GET
 		if p.cache != nil && p.cache.ShouldConsider(req) {
 			if cr, hashHex, err := p.cache.Load(req.URL); err == nil && cr != nil {
+				p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
+				cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone()}
+				verdict, scanErr := p.scanBufferedResponse(r.Context(), req, cachedResp, cr.Body)
+				if p.shouldBlock(verdict, scanErr) {
+					writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
+					return
+				}
+
 				for k, vv := range cr.Header {
 					for _, v := range vv {
 						w.Header().Add(k, v)
@@ -55,9 +81,11 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 				n, _ := w.Write(cr.Body)
 
 				p.logRequest("CACHE HIT HTTPS/2 %s %s -> status=%d, bytes=%d, dur=%s", req.Method, req.URL.String(), cr.Status, n, time.Since(start))
+				p.publishTrafficCompleted(requestID, req, cr.Status, n, time.Since(start), true, cr.Header)
 
 				return
 			}
+			p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 		}
 
 		resp, err := p.client.Do(req)
@@ -76,6 +104,11 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 
 		if p.cache != nil && p.cache.ShouldConsider(req) {
 			body, _ := io.ReadAll(resp.Body)
+			verdict, scanErr := p.scanBufferedResponse(r.Context(), req, resp, body)
+			if p.shouldBlock(verdict, scanErr) {
+				writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
+				return
+			}
 
 			for k, vv := range resp.Header {
 				for _, v := range vv {
@@ -88,7 +121,14 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 			p.cache.Save(req.URL, resp, body)
 
 			p.logRequest("HTTPS/2 %s %s -> status=%d, bytes=%d, dur=%s (cached)", req.Method, req.URL.String(), resp.StatusCode, n, time.Since(start))
+			p.publishTrafficCompleted(requestID, req, resp.StatusCode, n, time.Since(start), false, resp.Header)
 
+			return
+		}
+
+		verdict, scanErr = p.prepareResponseForScan(r.Context(), req, resp)
+		if p.shouldBlock(verdict, scanErr) {
+			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 			return
 		}
 
@@ -104,6 +144,7 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 		dur := time.Since(start)
 
 		p.logRequest("HTTPS/2 %s %s -> status=%d, bytes=%d, dur=%s", req.Method, req.URL.String(), resp.StatusCode, n, dur)
+		p.publishTrafficCompleted(requestID, req, resp.StatusCode, int(n), dur, false, resp.Header)
 	})
 
 	h2s.ServeConn(clientTLS, &http2.ServeConnOpts{Handler: handler})
