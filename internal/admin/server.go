@@ -25,6 +25,7 @@ import (
 	"mitm-proxy/internal/admin/auth"
 	"mitm-proxy/internal/admin/ui"
 	cfgpkg "mitm-proxy/internal/config"
+	"mitm-proxy/internal/copilot"
 	"mitm-proxy/internal/deployments"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/policy"
@@ -44,6 +45,7 @@ type Options struct {
 	ProxyStarted  time.Time
 	GeneratedAuth bool
 	ThreatScanner *threats.Manager
+	CopilotClient copilot.Client
 	EventBus      *events.Bus
 	SaveConfig    func(context.Context, *cfgpkg.Config) error
 	ReloadConfig  func(context.Context) error
@@ -90,6 +92,10 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
 	apiMux.HandleFunc("/api/repeater/cases", s.handleRepeaterCases)
 	apiMux.HandleFunc("/api/repeater/cases/", s.handleRepeaterCaseDetail)
+	apiMux.HandleFunc("/api/ai/traffic/", s.handleAITraffic)
+	apiMux.HandleFunc("/api/ai/repeater/cases/", s.handleAIRepeater)
+	apiMux.HandleFunc("/api/ai/notes", s.handleAINotes)
+	apiMux.HandleFunc("/api/ai/notes/", s.handleAINoteDetail)
 	apiMux.HandleFunc("/api/scopes", s.handleScopes)
 	apiMux.HandleFunc("/api/scopes/", s.handleScopeDetail)
 	apiMux.HandleFunc("/metrics", s.handleMetrics)
@@ -657,6 +663,369 @@ func (s *Server) handleRepeaterSend(w http.ResponseWriter, r *http.Request, id s
 	}
 	s.audit(r, "repeater.case.send", map[string]any{"id": id, "run_id": stored.ID, "status": stored.Status, "error": stored.Error})
 	writeJSON(w, http.StatusOK, stored)
+}
+
+func (s *Server) handleAITraffic(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/ai/traffic/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	id, action := parts[0], parts[1]
+	flow, ok, err := s.options.Store.GetTrafficDetail(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	var kind string
+	switch action {
+	case "explain":
+		kind = copilot.KindExplanation
+	case "suggest-tests":
+		kind = copilot.KindTestSuggestions
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown ai action"})
+		return
+	}
+	context := s.trafficAIContext(flow)
+	note, err := s.generateAINote(r.Context(), kind, "traffic", flow.ID, flow.ScopeID, context)
+	if err != nil {
+		http.Error(w, err.Error(), statusForAIError(err))
+		return
+	}
+	s.audit(r, "ai."+kind, map[string]any{"target_type": "traffic", "target_id": flow.ID, "note_id": note.ID})
+	writeJSON(w, http.StatusOK, note)
+}
+
+func (s *Server) handleAIRepeater(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/ai/repeater/cases/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+		return
+	}
+	id, action := parts[0], parts[1]
+	c, ok, err := s.options.Store.GetRepeaterCase(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+		return
+	}
+	runs, err := s.options.Store.ListRepeaterRuns(r.Context(), id, 2)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	var kind string
+	var context any
+	switch action {
+	case "suggest-tests":
+		kind = copilot.KindTestSuggestions
+		context = s.repeaterAIContext(c)
+	case "compare-runs":
+		if len(runs) < 2 {
+			http.Error(w, "at least two repeater runs are required", http.StatusBadRequest)
+			return
+		}
+		kind = copilot.KindRunComparison
+		context = s.repeaterRunComparisonContext(c, runs[0], runs[1])
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown ai action"})
+		return
+	}
+	note, err := s.generateAINote(r.Context(), kind, "repeater_case", c.ID, c.ScopeID, context)
+	if err != nil {
+		http.Error(w, err.Error(), statusForAIError(err))
+		return
+	}
+	s.audit(r, "ai."+kind, map[string]any{"target_type": "repeater_case", "target_id": c.ID, "note_id": note.ID})
+	writeJSON(w, http.StatusOK, note)
+}
+
+func (s *Server) handleAINotes(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		limit, _ := paginationParams(r, 100)
+		notes, err := s.options.Store.ListAINotes(r.Context(), store.AINoteFilter{
+			TargetType: r.URL.Query().Get("target_type"),
+			TargetID:   r.URL.Query().Get("target_id"),
+			ScopeID:    r.URL.Query().Get("scope_id"),
+			Limit:      limit,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, notes)
+	case http.MethodPost:
+		var note store.AINote
+		if err := json.NewDecoder(r.Body).Decode(&note); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(note.TargetType) == "" || strings.TrimSpace(note.TargetID) == "" {
+			http.Error(w, "target_type and target_id are required", http.StatusBadRequest)
+			return
+		}
+		created, err := s.options.Store.CreateAINote(r.Context(), note)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "ai.note.create", map[string]any{"id": created.ID, "target_type": created.TargetType, "target_id": created.TargetID})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleAINoteDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodDelete {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/ai/notes/"), "/")
+	if id == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "ai note not found"})
+		return
+	}
+	if err := s.options.Store.DeleteAINote(r.Context(), id); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "ai.note.delete", map[string]any{"id": id})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) generateAINote(ctx context.Context, kind, targetType, targetID, scopeID string, evidence any) (store.AINote, error) {
+	if kind == copilot.KindTestSuggestions && strings.TrimSpace(scopeID) == "" {
+		content := json.RawMessage(`{"summary":"This item is out of scope. Passive review only.","safe_manual_tests":[],"parameters_to_review":[],"headers_to_review":[],"scope_warning":"Out-of-scope traffic can be explained, but active testing suggestions are intentionally withheld."}`)
+		return s.options.Store.CreateAINote(ctx, store.AINote{
+			Kind:       kind,
+			TargetType: targetType,
+			TargetID:   targetID,
+			ScopeID:    scopeID,
+			Title:      "AI test suggestions",
+			Summary:    "This item is out of scope. Passive review only.",
+			Content:    content,
+		})
+	}
+	cfg := s.options.Config().AICopilot
+	if !cfg.Enabled {
+		return store.AINote{}, fmt.Errorf("AI copilot is disabled; enable ai_copilot.enabled in Settings or config.json and reload the running proxy")
+	}
+	client := s.options.CopilotClient
+	if client == nil {
+		client = copilot.NewOpenAIClient()
+	}
+	result, err := client.Generate(ctx, cfg, kind, evidence)
+	if err != nil {
+		return store.AINote{}, err
+	}
+	return s.options.Store.CreateAINote(ctx, store.AINote{
+		Kind:       kind,
+		TargetType: targetType,
+		TargetID:   targetID,
+		ScopeID:    scopeID,
+		Model:      result.Model,
+		PromptHash: result.PromptHash,
+		Title:      result.Title,
+		Summary:    result.Summary,
+		Content:    result.Content,
+	})
+}
+
+func statusForAIError(err error) int {
+	msg := strings.ToLower(err.Error())
+	if strings.Contains(msg, "deadline exceeded") || strings.Contains(msg, "timed out") {
+		return http.StatusGatewayTimeout
+	}
+	if strings.Contains(msg, "disabled") || strings.Contains(msg, "api key") || strings.Contains(msg, "unsupported") {
+		return http.StatusServiceUnavailable
+	}
+	return http.StatusBadGateway
+}
+
+func (s *Server) trafficAIContext(flow store.TrafficDetail) map[string]any {
+	cfg := s.options.Config().AICopilot
+	requestHeaders, responseHeaders := splitTrafficHeaders(flow.Headers)
+	query := map[string][]string{}
+	for k, vals := range flow.QueryParams {
+		query[k] = redactedStringValues(vals, cfg.RedactBeforeAI)
+	}
+	cookieNames := []string{}
+	for name := range flow.Cookies {
+		cookieNames = append(cookieNames, name)
+	}
+	return map[string]any{
+		"out_of_scope": !isConcreteScopeID(flow.ScopeID),
+		"scope_id":     flow.ScopeID,
+		"request": map[string]any{
+			"id":                  flow.ID,
+			"method":              flow.Method,
+			"url":                 redactedString(flow.URL, cfg.RedactBeforeAI),
+			"host":                flow.Host,
+			"protocol":            flow.Protocol,
+			"remote_ip":           flow.RemoteIP,
+			"query_params":        query,
+			"cookie_names":        cookieNames,
+			"headers":             redactedHeaders(requestHeaders, cfg.RedactBeforeAI),
+			"body_sample":         cappedBodySample(flow.RequestBody, cfg.MaxBodyBytes, cfg.RedactBeforeAI),
+			"body_sample_present": flow.RequestBody != "",
+		},
+		"response": map[string]any{
+			"status":              flow.Status,
+			"mime_type":           flow.MIMEType,
+			"duration_ms":         flow.DurationMS,
+			"bytes":               flow.Bytes,
+			"cache_hit":           flow.CacheHit,
+			"blocked":             flow.Blocked,
+			"rule_id":             flow.RuleID,
+			"headers":             redactedHeaders(responseHeaders, cfg.RedactBeforeAI),
+			"body_sample":         cappedBodySample(flow.ResponseBody, cfg.MaxBodyBytes, cfg.RedactBeforeAI),
+			"body_sample_present": flow.ResponseBody != "",
+		},
+	}
+}
+
+func (s *Server) repeaterAIContext(c store.RepeaterCase) map[string]any {
+	cfg := s.options.Config().AICopilot
+	return map[string]any{
+		"out_of_scope": !isConcreteScopeID(c.ScopeID),
+		"scope_id":     c.ScopeID,
+		"case": map[string]any{
+			"id":                  c.ID,
+			"name":                c.Name,
+			"source_flow_id":      c.SourceFlowID,
+			"method":              c.Method,
+			"url":                 redactedString(c.URL, cfg.RedactBeforeAI),
+			"timeout_ms":          c.TimeoutMS,
+			"headers":             redactedHeaders(http.Header(c.Headers), cfg.RedactBeforeAI),
+			"body_sample":         cappedBodySample(c.Body, cfg.MaxBodyBytes, cfg.RedactBeforeAI),
+			"body_sample_present": c.Body != "",
+		},
+	}
+}
+
+func (s *Server) repeaterRunComparisonContext(c store.RepeaterCase, current, previous store.RepeaterRun) map[string]any {
+	cfg := s.options.Config().AICopilot
+	return map[string]any{
+		"out_of_scope": !isConcreteScopeID(c.ScopeID),
+		"scope_id":     c.ScopeID,
+		"case": map[string]any{
+			"id":             c.ID,
+			"name":           c.Name,
+			"source_flow_id": c.SourceFlowID,
+			"method":         c.Method,
+			"url":            redactedString(c.URL, cfg.RedactBeforeAI),
+		},
+		"current_run":  repeaterRunAIContext(current, cfg),
+		"previous_run": repeaterRunAIContext(previous, cfg),
+	}
+}
+
+func repeaterRunAIContext(run store.RepeaterRun, cfg cfgpkg.AICopilotConfig) map[string]any {
+	return map[string]any{
+		"id":                  run.ID,
+		"created_at":          run.CreatedAt,
+		"status":              run.Status,
+		"duration_ms":         run.DurationMS,
+		"bytes":               run.Bytes,
+		"error":               run.Error,
+		"headers":             redactedHeaders(http.Header(run.ResponseHeaders), cfg.RedactBeforeAI),
+		"body_length":         len(run.ResponseBody),
+		"body_sample":         cappedBodySample(run.ResponseBody, cfg.MaxBodyBytes, cfg.RedactBeforeAI),
+		"body_sample_present": run.ResponseBody != "",
+	}
+}
+
+func splitTrafficHeaders(records []store.HeaderRecord) (http.Header, http.Header) {
+	requestHeaders := http.Header{}
+	responseHeaders := http.Header{}
+	for _, record := range records {
+		if record.Direction == "response" {
+			responseHeaders.Add(record.Name, record.Value)
+			continue
+		}
+		requestHeaders.Add(record.Name, record.Value)
+	}
+	return requestHeaders, responseHeaders
+}
+
+func redactedHeaders(headers http.Header, enabled bool) http.Header {
+	if !enabled {
+		out := http.Header{}
+		for key, values := range headers {
+			out[key] = append([]string(nil), values...)
+		}
+		return out
+	}
+	return threats.RedactHeaders(headers)
+}
+
+func cappedBodySample(body string, limit int64, redact bool) string {
+	if limit <= 0 {
+		limit = 32768
+	}
+	data := []byte(body)
+	if int64(len(data)) > limit {
+		data = data[:limit]
+	}
+	if redact {
+		data = threats.RedactBody(data)
+	}
+	return string(data)
+}
+
+func redactedString(value string, redact bool) string {
+	if !redact {
+		return value
+	}
+	return string(threats.RedactBody([]byte(value)))
+}
+
+func redactedStringValues(values []string, redact bool) []string {
+	out := make([]string, 0, len(values))
+	for _, value := range values {
+		out = append(out, redactedString(value, redact))
+	}
+	return out
+}
+
+func isConcreteScopeID(scopeID string) bool {
+	return strings.TrimSpace(scopeID) != "" && strings.TrimSpace(scopeID) != "__out_of_scope__"
 }
 
 func (s *Server) repeaterCaseFromInput(ctx context.Context, input repeaterCaseInput, id string) (store.RepeaterCase, error) {
@@ -1432,6 +1801,15 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				MaxBodyBytes *int64 `json:"max_body_bytes"`
 				RedactBodies *bool  `json:"redact_bodies"`
 			} `json:"traffic_capture"`
+			AICopilot *struct {
+				Enabled         *bool  `json:"enabled"`
+				Provider        string `json:"provider"`
+				Model           string `json:"model"`
+				TimeoutMS       *int   `json:"timeout_ms"`
+				MaxBodyBytes    *int64 `json:"max_body_bytes"`
+				RedactBeforeAI  *bool  `json:"redact_before_ai"`
+				OpenAIAPIKeyEnv string `json:"openai_api_key_env"`
+			} `json:"ai_copilot"`
 			Cache *struct {
 				Enabled           *bool    `json:"enabled"`
 				Directory         string   `json:"directory"`
@@ -1473,6 +1851,29 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			if input.TrafficCapture.RedactBodies != nil {
 				cfg.TrafficCapture.RedactBodies = *input.TrafficCapture.RedactBodies
+			}
+		}
+		if input.AICopilot != nil {
+			if input.AICopilot.Enabled != nil {
+				cfg.AICopilot.Enabled = *input.AICopilot.Enabled
+			}
+			if input.AICopilot.Provider != "" {
+				cfg.AICopilot.Provider = input.AICopilot.Provider
+			}
+			if input.AICopilot.Model != "" {
+				cfg.AICopilot.Model = input.AICopilot.Model
+			}
+			if input.AICopilot.TimeoutMS != nil {
+				cfg.AICopilot.TimeoutMS = *input.AICopilot.TimeoutMS
+			}
+			if input.AICopilot.MaxBodyBytes != nil {
+				cfg.AICopilot.MaxBodyBytes = *input.AICopilot.MaxBodyBytes
+			}
+			if input.AICopilot.RedactBeforeAI != nil {
+				cfg.AICopilot.RedactBeforeAI = *input.AICopilot.RedactBeforeAI
+			}
+			if input.AICopilot.OpenAIAPIKeyEnv != "" {
+				cfg.AICopilot.OpenAIAPIKeyEnv = input.AICopilot.OpenAIAPIKeyEnv
 			}
 		}
 		if input.Cache != nil {
@@ -1657,6 +2058,7 @@ func safeSettings(cfg *cfgpkg.Config) map[string]any {
 		"idle_timeout_seconds": cfg.IdleConnTimeout,
 		"cache":                cfg.Cache,
 		"traffic_capture":      cfg.TrafficCapture,
+		"ai_copilot":           cfg.AICopilot,
 	}
 }
 

@@ -40,6 +40,7 @@ var DashboardTables = []string{
 	"repeater_runs",
 	"research_scopes",
 	"cache_entries",
+	"ai_notes",
 }
 
 type AuditEntry struct {
@@ -153,6 +154,28 @@ type RepeaterRun struct {
 type RepeaterCaseDetail struct {
 	Case RepeaterCase  `json:"case"`
 	Runs []RepeaterRun `json:"runs"`
+}
+
+type AINote struct {
+	ID         string          `json:"id"`
+	CreatedAt  time.Time       `json:"created_at"`
+	UpdatedAt  time.Time       `json:"updated_at"`
+	Kind       string          `json:"kind"`
+	TargetType string          `json:"target_type"`
+	TargetID   string          `json:"target_id"`
+	ScopeID    string          `json:"scope_id,omitempty"`
+	Model      string          `json:"model,omitempty"`
+	PromptHash string          `json:"prompt_hash,omitempty"`
+	Title      string          `json:"title"`
+	Summary    string          `json:"summary,omitempty"`
+	Content    json.RawMessage `json:"content_json"`
+}
+
+type AINoteFilter struct {
+	TargetType string
+	TargetID   string
+	ScopeID    string
+	Limit      int
 }
 
 type Store struct {
@@ -599,6 +622,20 @@ func (s *Store) migrate(ctx context.Context) error {
 			size INTEGER NOT NULL,
 			content_type TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS ai_notes (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			target_type TEXT NOT NULL,
+			target_id TEXT NOT NULL,
+			scope_id TEXT,
+			model TEXT,
+			prompt_hash TEXT,
+			title TEXT NOT NULL,
+			summary TEXT,
+			content_json TEXT NOT NULL
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -705,6 +742,122 @@ func (s *Store) ListAudit(ctx context.Context, limit int) ([]AuditEntry, error) 
 	}
 
 	return entries, nil
+}
+
+func (s *Store) CreateAINote(ctx context.Context, note AINote) (AINote, error) {
+	if s == nil {
+		return note, nil
+	}
+	note = normalizeAINote(note)
+	if note.ID == "" {
+		note.ID = newStoreID()
+	}
+	now := time.Now().UTC()
+	if note.CreatedAt.IsZero() {
+		note.CreatedAt = now
+	}
+	note.UpdatedAt = now
+	if len(note.Content) == 0 {
+		note.Content = json.RawMessage(`{}`)
+	}
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO ai_notes (id, created_at, updated_at, kind, target_type, target_id, scope_id, model, prompt_hash, title, summary, content_json)
+		 VALUES (?, ?, ?, ?, ?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?)`,
+		note.ID, note.CreatedAt.Format(time.RFC3339Nano), note.UpdatedAt.Format(time.RFC3339Nano),
+		note.Kind, note.TargetType, note.TargetID, note.ScopeID, note.Model, note.PromptHash,
+		note.Title, note.Summary, string(note.Content))
+	if err != nil {
+		return AINote{}, fmt.Errorf("insert ai note: %w", err)
+	}
+	return note, nil
+}
+
+func (s *Store) ListAINotes(ctx context.Context, filter AINoteFilter) ([]AINote, error) {
+	if s == nil {
+		return nil, nil
+	}
+	limit := filter.Limit
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	where := []string{}
+	args := []any{}
+	if strings.TrimSpace(filter.TargetType) != "" {
+		where = append(where, "target_type = ?")
+		args = append(args, strings.TrimSpace(filter.TargetType))
+	}
+	if strings.TrimSpace(filter.TargetID) != "" {
+		where = append(where, "target_id = ?")
+		args = append(args, strings.TrimSpace(filter.TargetID))
+	}
+	if strings.TrimSpace(filter.ScopeID) != "" {
+		scopeID := strings.TrimSpace(filter.ScopeID)
+		if scopeID == "__out_of_scope__" {
+			where = append(where, "(scope_id IS NULL OR scope_id = '')")
+		} else {
+			where = append(where, "scope_id = ?")
+			args = append(args, scopeID)
+		}
+	}
+	clause := ""
+	if len(where) > 0 {
+		clause = " WHERE " + strings.Join(where, " AND ")
+	}
+	args = append(args, limit)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, created_at, updated_at, kind, target_type, target_id, COALESCE(scope_id, ''), COALESCE(model, ''),
+		 COALESCE(prompt_hash, ''), title, COALESCE(summary, ''), content_json
+		 FROM ai_notes`+clause+` ORDER BY created_at DESC LIMIT ?`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query ai notes: %w", err)
+	}
+	defer rows.Close()
+
+	notes := []AINote{}
+	for rows.Next() {
+		note, err := scanAINote(rows)
+		if err != nil {
+			return nil, err
+		}
+		notes = append(notes, note)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate ai notes: %w", err)
+	}
+	return notes, nil
+}
+
+func (s *Store) DeleteAINote(ctx context.Context, id string) error {
+	if s == nil {
+		return nil
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM ai_notes WHERE id = ?`, strings.TrimSpace(id)); err != nil {
+		return fmt.Errorf("delete ai note: %w", err)
+	}
+	return nil
+}
+
+func normalizeAINote(note AINote) AINote {
+	note.Kind = strings.TrimSpace(note.Kind)
+	note.TargetType = strings.TrimSpace(note.TargetType)
+	note.TargetID = strings.TrimSpace(note.TargetID)
+	note.ScopeID = strings.TrimSpace(note.ScopeID)
+	note.Model = strings.TrimSpace(note.Model)
+	note.PromptHash = strings.TrimSpace(note.PromptHash)
+	note.Title = strings.TrimSpace(note.Title)
+	note.Summary = strings.TrimSpace(note.Summary)
+	if note.Kind == "" {
+		note.Kind = "manual"
+	}
+	if note.Title == "" {
+		note.Title = "AI research note"
+	}
+	return note
 }
 
 func (s *Store) AddAdminUser(ctx context.Context, name, role string) (AdminUser, error) {
@@ -973,6 +1126,7 @@ func (s *Store) PurgeResearchData(ctx context.Context, includeCache bool) error 
 		"repeater_runs",
 		"repeater_cases",
 		"research_scopes",
+		"ai_notes",
 	}
 	if includeCache {
 		tables = append(tables, "cache_entries")
@@ -1191,6 +1345,7 @@ func (s *Store) DeleteResearchScope(ctx context.Context, id string) error {
 		`UPDATE traffic_flows SET scope_id = NULL WHERE scope_id = ?`,
 		`UPDATE repeater_cases SET scope_id = NULL WHERE scope_id = ?`,
 		`UPDATE threat_events SET scope_id = NULL WHERE scope_id = ?`,
+		`UPDATE ai_notes SET scope_id = NULL WHERE scope_id = ?`,
 		`DELETE FROM research_scopes WHERE id = ?`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement, id); err != nil {
@@ -1564,6 +1719,22 @@ func scanRepeaterRun(row trafficScanner) (RepeaterRun, error) {
 		run.ResponseHeaders = map[string][]string{}
 	}
 	return run, nil
+}
+
+func scanAINote(row trafficScanner) (AINote, error) {
+	var note AINote
+	var createdAt, updatedAt, content string
+	if err := row.Scan(&note.ID, &createdAt, &updatedAt, &note.Kind, &note.TargetType, &note.TargetID,
+		&note.ScopeID, &note.Model, &note.PromptHash, &note.Title, &note.Summary, &content); err != nil {
+		return AINote{}, err
+	}
+	note.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	note.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	if strings.TrimSpace(content) == "" {
+		content = "{}"
+	}
+	note.Content = json.RawMessage(content)
+	return normalizeAINote(note), nil
 }
 
 func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {

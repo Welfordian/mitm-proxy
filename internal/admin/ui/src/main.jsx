@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import {
   Activity,
   Ban,
+  Bot,
   Crosshair,
   Database,
   Download,
@@ -16,6 +17,7 @@ import {
   Save,
   ScrollText,
   Send,
+  Sparkles,
   Server,
   Settings,
   ShieldAlert,
@@ -30,6 +32,7 @@ const VIEWS = [
     ["Dashboard", LayoutDashboard],
     ["Traffic", Activity],
     ["Repeater", Repeat],
+    ["AI Copilot", Bot],
     ["Threat Scanner", ShieldAlert],
     ["Certificates", ShieldCheck],
     ["Scopes", Crosshair],
@@ -48,6 +51,7 @@ const VIEW_SLUGS = {
   Dashboard: "",
   Traffic: "traffic",
   Repeater: "repeater",
+  "AI Copilot": "ai-copilot",
   "Threat Scanner": "threat-scanner",
   Certificates: "certificates",
   Scopes: "scopes",
@@ -104,7 +108,11 @@ async function request(path, options = {}) {
   const t = getToken();
   if (t) headers.Authorization = `Bearer ${t}`;
   const res = await fetch(path, { ...options, headers });
-  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  if (!res.ok) {
+    const body = await res.text().catch(() => "");
+    const detail = body.trim();
+    throw new Error(detail ? `${res.status} ${res.statusText}: ${detail}` : `${res.status} ${res.statusText}`);
+  }
   return res.json();
 }
 
@@ -226,6 +234,7 @@ function App() {
     switch (current) {
       case "Traffic": return <TrafficView {...props} />;
       case "Repeater": return <RepeaterView {...props} />;
+      case "AI Copilot": return <AICopilotView {...props} />;
       case "Threat Scanner": return <ThreatScannerView {...props} />;
       case "Certificates": return <CertificatesView {...props} />;
       case "Scopes": return <ScopesView {...props} setSelectedScope={setSelectedScope} />;
@@ -516,6 +525,16 @@ function FlowRow({ flow, scopes, active, onSelect }) {
 function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
   const reqHeaders = (flow.headers || []).filter((h) => h.direction === "request");
   const respHeaders = (flow.headers || []).filter((h) => h.direction === "response");
+  const [aiState, setAIState] = useState({ loading: false, error: "", note: null });
+  const runAI = async (action) => {
+    setAIState({ loading: true, error: "", note: null });
+    try {
+      const note = await post(`/api/ai/traffic/${encodeURIComponent(flow.id)}/${action}`);
+      setAIState({ loading: false, error: "", note });
+    } catch (error) {
+      setAIState({ loading: false, error: error.message, note: null });
+    }
+  };
   return (
     <div className="detail-shell">
       <div className="detail-topbar">
@@ -533,8 +552,11 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
             setCurrent("Repeater");
           }}><Repeat />Clone</button>
           <button className="secondary" onClick={async () => { await post(`/api/traffic/${encodeURIComponent(flow.id)}/replay`); refresh(); }}><Play />Replay</button>
+          <button className="secondary" onClick={() => runAI("explain")}><Sparkles />Explain</button>
+          <button className="secondary" onClick={() => runAI("suggest-tests")}><Bot />Suggest Tests</button>
         </div>
       </div>
+      <AIResultPanel state={aiState} />
       <div className="grid metrics-grid compact">
         <Metric label="Method" value={flow.method || ""} />
         <Metric label="Status" value={flow.status || ""} />
@@ -661,6 +683,7 @@ function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
   const [selectedRun, setSelectedRun] = useState(runs[0]?.id || "");
   const currentRun = runs.find((run) => run.id === selectedRun) || runs[0];
   const previousRun = runs[runs.findIndex((run) => run.id === currentRun?.id) + 1];
+  const [aiState, setAIState] = useState({ loading: false, error: "", note: null });
   const update = (key, value) => setForm((prev) => ({ ...prev, [key]: value }));
   const payload = () => ({
     name: form.name,
@@ -674,6 +697,15 @@ function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
     await putJSON(`/api/repeater/cases/${encodeURIComponent(c.id)}`, payload());
     refresh();
   };
+  const runAI = async (action) => {
+    setAIState({ loading: true, error: "", note: null });
+    try {
+      const note = await post(`/api/ai/repeater/cases/${encodeURIComponent(c.id)}/${action}`);
+      setAIState({ loading: false, error: "", note });
+    } catch (error) {
+      setAIState({ loading: false, error: error.message, note: null });
+    }
+  };
 
   return (
     <div className="detail-shell">
@@ -686,9 +718,12 @@ function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
         <div className="detail-actions">
           <button className="secondary" onClick={save}><Save />Save</button>
           <button className="primary" onClick={async () => { await save(); await post(`/api/repeater/cases/${encodeURIComponent(c.id)}/send`); refresh(); }}><Send />Send</button>
+          <button className="secondary" onClick={() => runAI("suggest-tests")}><Bot />Suggest Tests</button>
+          <button className="secondary" disabled={runs.length < 2} onClick={() => runAI("compare-runs")}><Sparkles />Compare Runs</button>
           <button className="secondary danger-button" onClick={async () => { await del(`/api/repeater/cases/${encodeURIComponent(c.id)}`); clearSelected(); refresh(); }}><Trash2 />Delete</button>
         </div>
       </div>
+      <AIResultPanel state={aiState} />
       <div className="editor-stack">
         <label>Name<input value={form.name} onChange={(e) => update("name", e.target.value)} /></label>
         <div className="request-line">
@@ -772,6 +807,136 @@ function compareRuns(run, previous) {
     headers_added: currentHeaders.filter((h) => !previousHeaders.includes(h)),
     headers_removed: previousHeaders.filter((h) => !currentHeaders.includes(h)),
   };
+}
+
+function AIResultPanel({ state }) {
+  if (!state.loading && !state.error && !state.note) return null;
+  return (
+    <div className="section-card ai-result">
+      <h3>AI Copilot</h3>
+      {state.loading && <p className="muted">Asking the research copilot...</p>}
+      {state.error && <p className="error-text">Unable to run AI action: {state.error}</p>}
+      {state.note && (
+        <>
+          <div className="note-head">
+            <strong>{state.note.title}</strong>
+            <span className="muted">{state.note.model || "local guardrail"}</span>
+          </div>
+          {state.note.summary && <p>{state.note.summary}</p>}
+          <AIContent content={state.note.content_json || {}} />
+          <p className="muted">Saved as research note {state.note.id}</p>
+        </>
+      )}
+    </div>
+  );
+}
+
+function AIContent({ content }) {
+  const payload = typeof content === "string" ? safeParseJSON(content) : content;
+  if (!payload || typeof payload !== "object") return <pre>{String(content || "")}</pre>;
+  return (
+    <div className="ai-content">
+      {Object.entries(payload).map(([key, value]) => (
+        <div key={key} className="ai-content-row">
+          <strong>{humanLabel(key)}</strong>
+          {Array.isArray(value) ? (
+            value.length ? <ul>{value.map((item, idx) => <li key={`${key}-${idx}`}>{String(item)}</li>)}</ul> : <p className="muted">None.</p>
+          ) : <p>{String(value || "")}</p>}
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function safeParseJSON(value) {
+  try {
+    return JSON.parse(value);
+  } catch {
+    return value;
+  }
+}
+
+function humanLabel(value) {
+  return String(value || "").replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function AICopilotView({ refreshKey, refresh, selectedScope, scopes, setCurrent }) {
+  const [targetType, setTargetType] = useState("");
+  const query = new URLSearchParams({ limit: "100" });
+  if (targetType) query.set("target_type", targetType);
+  if (selectedScope && selectedScope !== "all") query.set("scope_id", selectedScope);
+  const state = useAsync(() => api(`/api/ai/notes?${query.toString()}`), [refreshKey, selectedScope, targetType]);
+  const [selected, setSelected] = useState("");
+  const notes = state.data || [];
+  const active = notes.find((note) => note.id === selected) || notes[0];
+
+  useEffect(() => {
+    if (notes.length && !notes.some((note) => note.id === selected)) setSelected(notes[0].id);
+    if (!notes.length) setSelected("");
+  }, [notes, selected]);
+
+  if (state.loading || state.error) return <PageState state={state} />;
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head">
+          <div>
+            <h2>AI Copilot</h2>
+            <p>Saved AI research notes and analysis.</p>
+          </div>
+          <div className="list-filter">
+            <select value={targetType} onChange={(e) => setTargetType(e.target.value)}>
+              <option value="">All targets</option>
+              <option value="traffic">Traffic</option>
+              <option value="repeater_case">Repeater cases</option>
+              <option value="repeater_run">Repeater runs</option>
+              <option value="threat_event">Threat events</option>
+              <option value="scope">Scopes</option>
+            </select>
+          </div>
+        </div>
+        <div className="workbench-list">
+          {notes.length ? notes.map((note) => (
+            <button key={note.id} className={`list-row ${active?.id === note.id ? "active" : ""}`} onClick={() => setSelected(note.id)}>
+              <div className="list-row-title">
+                <Bot />
+                <span>{note.title}</span>
+                <ScopeBadge scopeID={note.scope_id} scopes={scopes} />
+              </div>
+              <div className="list-row-meta">{note.kind} - {note.target_type}:{note.target_id}</div>
+              <div className="list-row-meta">{note.created_at}</div>
+            </button>
+          )) : <EmptyList>No AI notes saved yet.</EmptyList>}
+        </div>
+      </aside>
+      <section className="workbench-main">
+        {!active ? <EmptyDetail title="AI Note Detail" body="Run an AI action from Traffic or Repeater to save research notes." /> : (
+          <div className="detail-shell">
+            <div className="detail-topbar">
+              <div className="detail-title">
+                <h2>{active.title}</h2>
+                <ScopeBadge scopeID={active.scope_id} scopes={scopes} />
+                <div className="url-line">{active.target_type}:{active.target_id}</div>
+              </div>
+              <div className="detail-actions">
+                {active.target_type === "traffic" && <button className="secondary" onClick={() => setCurrent("Traffic")}>Open Traffic</button>}
+                {active.target_type === "repeater_case" && <button className="secondary" onClick={() => { sessionStorage.setItem("selectedRepeaterCase", active.target_id); setCurrent("Repeater"); }}>Open Repeater</button>}
+                <button className="secondary danger-button" onClick={async () => { await del(`/api/ai/notes/${encodeURIComponent(active.id)}`); refresh(); }}><Trash2 />Delete</button>
+              </div>
+            </div>
+            <div className="grid metrics-grid compact">
+              <Metric label="Kind" value={active.kind} />
+              <Metric label="Model" value={active.model || "local"} />
+              <Metric label="Created" value={active.created_at} />
+              <Metric label="Prompt hash" value={active.prompt_hash || ""} />
+            </div>
+            {active.summary && <div className="section-card"><h3>Summary</h3><p>{active.summary}</p></div>}
+            <div className="section-card"><h3>Content</h3><AIContent content={active.content_json || {}} /></div>
+          </div>
+        )}
+      </section>
+    </div>
+  );
 }
 
 function CertificatesView({ refreshKey, refresh }) {
@@ -1064,13 +1229,62 @@ function SettingsView({ refreshKey, refresh }) {
   useEffect(() => { if (state.data) setForm(state.data); }, [state.data]);
   if (state.loading || state.error || !form) return <PageState state={state} />;
   const capture = form.traffic_capture || {};
+  const aiCopilot = form.ai_copilot || {};
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
+  const setCapture = (patch) => set({ traffic_capture: { ...capture, ...patch } });
+  const setAICopilot = (patch) => set({ ai_copilot: { ...aiCopilot, ...patch } });
   const danger = async (action, message) => {
     if (!confirm(message)) return;
     await postJSON("/api/settings/danger", { action, confirm: true });
     refresh();
   };
-  return <div className="page-stack"><PageTitle title="Settings" subtitle="Runtime behavior and capture policy." /><div className="panel"><div className="detail-topbar"><h2>Settings</h2><button className="primary" onClick={async () => { await putJSON("/api/settings", form); refresh(); }}><Save />Save</button></div><div className="settings-grid"><label><input type="checkbox" checked={!!form.enable_mitm} onChange={(e) => set({ enable_mitm: e.target.checked })} /> Enable MITM</label><label><input type="checkbox" checked={!!form.verbose_logging} onChange={(e) => set({ verbose_logging: e.target.checked })} /> Verbose logging</label><label><input type="checkbox" checked={!!form.log_requests} onChange={(e) => set({ log_requests: e.target.checked })} /> Request logging</label><label>TLS minimum<input value={form.min_tls_version || ""} onChange={(e) => set({ min_tls_version: e.target.value })} /></label><label>Idle timeout<input type="number" value={form.idle_timeout_seconds || 0} onChange={(e) => set({ idle_timeout_seconds: Number(e.target.value) })} /></label></div><h3>Traffic Capture</h3><div className="settings-grid"><label><input type="checkbox" checked={!!capture.store_bodies} onChange={(e) => set({ traffic_capture: { ...capture, store_bodies: e.target.checked } })} /> Store body samples</label><label><input type="checkbox" checked={capture.redact_bodies !== false} onChange={(e) => set({ traffic_capture: { ...capture, redact_bodies: e.target.checked } })} /> Redact body samples</label><label>Max body bytes<input type="number" value={capture.max_body_bytes || 32768} onChange={(e) => set({ traffic_capture: { ...capture, max_body_bytes: Number(e.target.value) } })} /></label></div><h3>Excluded Domains</h3><textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} /><CodeCard title="Cache" value={form.cache || {}} /></div><div className="panel danger-zone"><div className="detail-topbar"><div><h2>Dangerous</h2><p className="muted">Destructive maintenance actions. Each action requires confirmation.</p></div></div><div className="actions"><button className="secondary danger-button" onClick={() => danger("all", "Purge all stored dashboard research data, including cache? This cannot be undone.")}><Trash2 />Purge All Data</button><button className="secondary danger-button" onClick={() => danger("except_cache", "Purge all stored dashboard research data except cache? This cannot be undone.")}><Trash2 />Purge All Except Cache</button><button className="secondary danger-button" onClick={() => danger("cache", "Purge all cached responses? This cannot be undone.")}><Trash2 />Purge Cache</button></div></div></div>;
+  return (
+    <div className="page-stack">
+      <PageTitle title="Settings" subtitle="Runtime behavior and capture policy." />
+      <div className="panel">
+        <div className="detail-topbar">
+          <h2>Settings</h2>
+          <button className="primary" onClick={async () => { await putJSON("/api/settings", form); refresh(); }}><Save />Save</button>
+        </div>
+        <h3>Runtime</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!form.enable_mitm} onChange={(e) => set({ enable_mitm: e.target.checked })} /> Enable MITM</label>
+          <label><input type="checkbox" checked={!!form.verbose_logging} onChange={(e) => set({ verbose_logging: e.target.checked })} /> Verbose logging</label>
+          <label><input type="checkbox" checked={!!form.log_requests} onChange={(e) => set({ log_requests: e.target.checked })} /> Request logging</label>
+          <label>TLS minimum<input value={form.min_tls_version || ""} onChange={(e) => set({ min_tls_version: e.target.value })} /></label>
+          <label>Idle timeout<input type="number" value={form.idle_timeout_seconds || 0} onChange={(e) => set({ idle_timeout_seconds: Number(e.target.value) })} /></label>
+        </div>
+        <h3>Traffic Capture</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!capture.store_bodies} onChange={(e) => setCapture({ store_bodies: e.target.checked })} /> Store body samples</label>
+          <label><input type="checkbox" checked={capture.redact_bodies !== false} onChange={(e) => setCapture({ redact_bodies: e.target.checked })} /> Redact body samples</label>
+          <label>Max body bytes<input type="number" value={capture.max_body_bytes || 32768} onChange={(e) => setCapture({ max_body_bytes: Number(e.target.value) })} /></label>
+        </div>
+        <h3>AI Copilot</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!aiCopilot.enabled} onChange={(e) => setAICopilot({ enabled: e.target.checked })} /> Enable AI Copilot</label>
+          <label>Provider<input value={aiCopilot.provider || "openai"} onChange={(e) => setAICopilot({ provider: e.target.value })} /></label>
+          <label>Model<input value={aiCopilot.model || ""} onChange={(e) => setAICopilot({ model: e.target.value })} /></label>
+          <label>Timeout ms<input type="number" value={aiCopilot.timeout_ms || 10000} onChange={(e) => setAICopilot({ timeout_ms: Number(e.target.value) })} /></label>
+          <label>Max body bytes<input type="number" value={aiCopilot.max_body_bytes || 32768} onChange={(e) => setAICopilot({ max_body_bytes: Number(e.target.value) })} /></label>
+          <label>API key env var<input value={aiCopilot.openai_api_key_env || "OPENAI_API_KEY"} onChange={(e) => setAICopilot({ openai_api_key_env: e.target.value })} /></label>
+          <label><input type="checkbox" checked={aiCopilot.redact_before_ai !== false} onChange={(e) => setAICopilot({ redact_before_ai: e.target.checked })} /> Redact before AI</label>
+        </div>
+        <p className="muted">API keys are read from the proxy process environment and are never stored in dashboard settings.</p>
+        <h3>Excluded Domains</h3>
+        <textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} />
+        <CodeCard title="Cache" value={form.cache || {}} />
+      </div>
+      <div className="panel danger-zone">
+        <div className="detail-topbar"><div><h2>Dangerous</h2><p className="muted">Destructive maintenance actions. Each action requires confirmation.</p></div></div>
+        <div className="actions">
+          <button className="secondary danger-button" onClick={() => danger("all", "Purge all stored dashboard research data, including cache? This cannot be undone.")}><Trash2 />Purge All Data</button>
+          <button className="secondary danger-button" onClick={() => danger("except_cache", "Purge all stored dashboard research data except cache? This cannot be undone.")}><Trash2 />Purge All Except Cache</button>
+          <button className="secondary danger-button" onClick={() => danger("cache", "Purge all cached responses? This cannot be undone.")}><Trash2 />Purge Cache</button>
+        </div>
+      </div>
+    </div>
+  );
 }
 
 function AdminUsersView({ refreshKey, refresh }) {

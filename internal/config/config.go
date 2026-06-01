@@ -66,6 +66,9 @@ type Config struct {
 	// Threat scanning
 	ThreatScanner ThreatScannerConfig `json:"threat_scanner"`
 
+	// AI copilot powers optional research assistance in the admin dashboard.
+	AICopilot AICopilotConfig `json:"ai_copilot"`
+
 	// Traffic capture controls body persistence for dashboard inspection.
 	TrafficCapture TrafficCaptureConfig `json:"traffic_capture"`
 
@@ -121,6 +124,16 @@ type ThreatScannerConfig struct {
 	OpenAIAPIKeyEnv          string   `json:"openai_api_key_env"`
 }
 
+type AICopilotConfig struct {
+	Enabled         bool   `json:"enabled"`
+	Provider        string `json:"provider"`
+	Model           string `json:"model"`
+	TimeoutMS       int    `json:"timeout_ms"`
+	MaxBodyBytes    int64  `json:"max_body_bytes"`
+	RedactBeforeAI  bool   `json:"redact_before_ai"`
+	OpenAIAPIKeyEnv string `json:"openai_api_key_env"`
+}
+
 type TrafficCaptureConfig struct {
 	StoreBodies  bool  `json:"store_bodies"`
 	MaxBodyBytes int64 `json:"max_body_bytes"`
@@ -158,11 +171,24 @@ func defaultConfig() *Config {
 			TTL:       3600,
 		},
 		ThreatScanner: defaultThreatScannerConfig(),
+		AICopilot:     defaultAICopilotConfig(),
 		TrafficCapture: TrafficCaptureConfig{
 			StoreBodies:  false,
 			MaxBodyBytes: 32768,
 			RedactBodies: true,
 		},
+	}
+}
+
+func defaultAICopilotConfig() AICopilotConfig {
+	return AICopilotConfig{
+		Enabled:         false,
+		Provider:        "openai",
+		Model:           "gpt-5.4-nano",
+		TimeoutMS:       30000,
+		MaxBodyBytes:    32768,
+		RedactBeforeAI:  true,
+		OpenAIAPIKeyEnv: "OPENAI_API_KEY",
 	}
 }
 
@@ -253,6 +279,7 @@ func Load(path string) (*Config, error) {
 	}
 
 	applyThreatScannerDefaults(&cfg.ThreatScanner)
+	applyAICopilotDefaults(&cfg.AICopilot, cfg.ThreatScanner)
 	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
 
 	if strings.TrimSpace(cfg.AdminAddr) == "" {
@@ -288,6 +315,29 @@ func Load(path string) (*Config, error) {
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+func applyAICopilotDefaults(c *AICopilotConfig, scanner ThreatScannerConfig) {
+	defaults := defaultAICopilotConfig()
+	if c.Provider == "" {
+		c.Provider = defaults.Provider
+	}
+	if c.Model == "" {
+		if scanner.Model != "" {
+			c.Model = scanner.Model
+		} else {
+			c.Model = defaults.Model
+		}
+	}
+	if c.TimeoutMS == 0 {
+		c.TimeoutMS = defaults.TimeoutMS
+	}
+	if c.MaxBodyBytes == 0 {
+		c.MaxBodyBytes = defaults.MaxBodyBytes
+	}
+	if c.OpenAIAPIKeyEnv == "" {
+		c.OpenAIAPIKeyEnv = defaults.OpenAIAPIKeyEnv
+	}
 }
 
 func applyTrafficCaptureDefaults(c *TrafficCaptureConfig) {

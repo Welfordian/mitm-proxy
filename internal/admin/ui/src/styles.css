@@ -175,7 +175,8 @@ body {
 
 .sidebar button svg,
 .secondary svg,
-.primary svg {
+.primary svg,
+.list-row svg {
   width: 17px;
   height: 17px;
   flex: none;
@@ -597,7 +598,8 @@ textarea {
   margin-top: 12px;
 }
 
-.list-filter input {
+.list-filter input,
+.list-filter select {
   width: 100%;
 }
 
@@ -699,6 +701,11 @@ textarea {
   flex-wrap: wrap;
 }
 
+.detail-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+
 .section-card {
   min-width: 0;
   border-radius: 8px;
@@ -710,6 +717,43 @@ textarea {
   margin: 0 0 10px;
   font-size: 15px;
   font-weight: 600;
+}
+
+.ai-result {
+  border-color: var(--signal-100);
+  background: linear-gradient(180deg, var(--bg-surface), var(--signal-50));
+}
+
+.note-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 12px;
+  align-items: center;
+  margin-bottom: 8px;
+}
+
+.ai-content {
+  display: grid;
+  gap: 10px;
+}
+
+.ai-content-row {
+  border-top: 1px solid var(--border);
+  padding-top: 10px;
+}
+
+.ai-content-row:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.ai-content-row p,
+.ai-content-row ul {
+  margin: 6px 0 0;
+}
+
+.error-text {
+  color: var(--danger-fg);
 }
 
 .kv-table { table-layout: fixed; }

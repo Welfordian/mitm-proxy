@@ -1,17 +1,10 @@
 {
   "listen_addr": ":8080",
-  "proxy_name": "MITM-Proxy",
-  "ca_cert_path": null,
-  "ca_key_path": null,
+  "ca_cert_path": "",
+  "ca_key_path": "",
   "ca_cert_output_path": "ca-cert.pem",
   "ca_key_output_path": "ca-key.pem",
   "enable_mitm": true,
-  "admin_enabled": true,
-  "admin_addr": "127.0.0.1:9090",
-  "admin_token": "",
-  "admin_read_token": "",
-  "admin_ui": true,
-  "admin_store": "dashboard.db",
   "excluded_domains": [],
   "verbose_logging": true,
   "log_requests": true,
@@ -19,14 +12,43 @@
   "idle_conn_timeout_seconds": 90,
   "tls_handshake_timeout_seconds": 10,
   "min_tls_version": "1.2",
-  "tls_next_protos": ["h2", "http/1.1"],
-  "blocked_ports": [25, 445, 3389],
+  "tls_next_protos": [
+    "h2",
+    "http/1.1"
+  ],
+  "proxy_name": "MITM-Proxy",
+  "admin_enabled": true,
+  "admin_addr": "127.0.0.1:9090",
+  "admin_token": "",
+  "admin_read_token": "",
+  "admin_ui": true,
+  "admin_store": "dashboard.db",
+  "cache": {
+    "enabled": true,
+    "directory": "F:\\Cache",
+    "include_domains": [],
+    "exclude_domains": [],
+    "include_extensions": [
+      "jpg",
+      "png",
+      "webp",
+      "css",
+      "js"
+    ],
+    "exclude_extensions": [],
+    "ttl": 3600
+  },
+  "blocked_ports": [
+    25,
+    445,
+    3389
+  ],
   "blocked_domains": [],
   "blocked_ips": [],
   "block_action": "deny",
   "block_response_status": 403,
   "threat_scanner": {
-    "enabled": true,
+    "enabled": false,
     "mode": "suspicious_only",
     "provider": "openai",
     "model": "gpt-5.4-nano",
@@ -68,20 +90,21 @@
     "quarantine_dir": "quarantine",
     "debug_log_path": "threats.log",
     "redact_before_ai": true,
-    "store_bodies": false
+    "store_bodies": true,
+    "openai_api_key_env": "OPENAI_API_KEY"
   },
   "traffic_capture": {
-    "store_bodies": false,
+    "store_bodies": true,
     "max_body_bytes": 32768,
     "redact_bodies": true
   },
-  "cache": {
-    "enabled": false,
-    "directory": "/var/cache/mitm-proxy",
-    "include_domains": [],
-    "exclude_domains": [],
-    "include_extensions": ["jpg", "png", "webp", "css", "js"],
-    "exclude_extensions": [],
-    "ttl": 3600
+  "ai_copilot": {
+    "enabled": true,
+    "openai_api_key_env": "OPENAI_API_KEY",
+    "provider": "openai",
+    "model": "gpt-5.4-nano",
+    "timeout_ms": 60000,
+    "max_body_bytes": 32768,
+    "redact_before_ai": true
   }
 }

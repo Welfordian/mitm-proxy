@@ -202,6 +202,7 @@ Initial dashboard/API coverage includes:
 - GET /api/traffic/export?format=har for HAR-style export
 - GET/POST/PUT/DELETE /api/repeater/cases and POST /api/repeater/cases/{id}/send for saved editable replay cases
 - GET/POST/PUT/DELETE /api/scopes plus scope assignment endpoints for traffic and repeater cases
+- POST /api/ai/traffic/{id}/explain, POST /api/ai/traffic/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/compare-runs, and GET/POST/DELETE /api/ai/notes for AI research copilot notes
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
 - GET/POST/DELETE block rules for ports, domains, and IPs
 - GET /api/deployments/current, POST /api/deployments/current/reload, GET /api/logs, GET /api/cache with cached entries and hit/miss counts, POST /api/cache/purge, and GET/PUT /api/settings
@@ -235,6 +236,30 @@ The dashboard's **Scopes** view lets researchers define named target boundaries 
 The global scope selector filters Traffic, Repeater, and Threat Scanner views across all traffic, a selected enabled scope, or out-of-scope items. Deleting a scope clears related `scope_id` values without deleting captured traffic, Repeater cases, runs, or threat data.
 
 Scope filters are available on `GET /api/traffic`, `GET /api/repeater/cases`, and `GET /api/threats/events` with `scope_id=<id>` or `scope_id=__out_of_scope__`. Add `include_out_of_scope=true` to include unscoped rows beside a selected scope.
+
+### AI Research Copilot
+
+The dashboard's **AI Copilot** view stores AI-generated research notes linked to Traffic, Repeater cases, runs, scopes, or threat events. Traffic detail can ask the copilot to explain a request or suggest next manual tests; Repeater can suggest tests for a saved case or compare the latest two runs.
+
+The copilot is advisory only. It never sends traffic, edits Repeater cases, changes scopes, changes settings, or purges data. Out-of-scope traffic can be explained, but active testing suggestions are intentionally withheld.
+
+Enable it through `ai_copilot` in `config.json` or the Settings view:
+
+```json
+{
+  "ai_copilot": {
+    "enabled": true,
+    "provider": "openai",
+    "model": "gpt-5.4-nano",
+    "timeout_ms": 10000,
+    "max_body_bytes": 32768,
+    "redact_before_ai": true,
+    "openai_api_key_env": "OPENAI_API_KEY"
+  }
+}
+```
+
+The OpenAI API key is read from the configured environment variable and is not stored in the dashboard or config file. Sensitive headers, body samples, and query values are redacted before AI context is sent when `redact_before_ai` is enabled. Saved notes include the model, prompt hash, summary, and structured AI output, not the full prompt.
 
 ### AI Threat Scanning
 
