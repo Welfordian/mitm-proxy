@@ -314,15 +314,33 @@ function RepeaterView({ refreshKey, refresh }) {
   }, [selected, refreshKey]);
 
   useEffect(() => {
+    if (state.loading) return;
+    if (selected && !cases.some((item) => item.id === selected)) {
+      sessionStorage.removeItem("selectedRepeaterCase");
+      setSelected(cases[0]?.id || "");
+      return;
+    }
     if (!selected && cases.length) setSelected(cases[0].id);
-  }, [cases, selected]);
+  }, [cases, selected, state.loading]);
 
   useEffect(() => {
-    if (selected) sessionStorage.setItem("selectedRepeaterCase", selected);
-  }, [selected]);
+    if (isNotFound(detailState.error)) {
+      sessionStorage.removeItem("selectedRepeaterCase");
+      setSelected("");
+    }
+  }, [detailState.error]);
+
+  useEffect(() => {
+    if (selected) {
+      sessionStorage.setItem("selectedRepeaterCase", selected);
+    } else {
+      sessionStorage.removeItem("selectedRepeaterCase");
+    }
+  }, [cases, selected]);
 
   if (state.loading || state.error) return <PageState state={state} />;
   const detail = detailState.data;
+  const detailError = isNotFound(detailState.error) ? null : detailState.error;
   return (
     <div className="workbench">
       <aside className="workbench-sidebar">
@@ -351,12 +369,16 @@ function RepeaterView({ refreshKey, refresh }) {
         </div>
       </aside>
       <section className="workbench-main">
-        {detailState.error && <div className="detail-shell error">{detailState.error.message}</div>}
-        {!detail && !detailState.error && <EmptyDetail title="Request Builder" body="Create a case or clone a captured request from Traffic." />}
+        {detailError && <div className="detail-shell error">{detailError.message}</div>}
+        {!detail && !detailError && <EmptyDetail title="Request Builder" body="Create a case or clone a captured request from Traffic." />}
         {detail && <RepeaterEditor detail={detail} refresh={refresh} clearSelected={() => setSelected("")} />}
       </section>
     </div>
   );
+}
+
+function isNotFound(error) {
+  return Boolean(error && /^404\b/.test(error.message || ""));
 }
 
 function RepeaterRow({ item, active, onSelect }) {
@@ -367,7 +389,7 @@ function RepeaterRow({ item, active, onSelect }) {
         <span>{item.name || item.id}</span>
       </div>
       <div className="list-row-meta">{item.url || ""}</div>
-      <div className="list-row-meta">{item.source_flow_id ? `source ${item.source_flow_id}` : "manual case"} · {item.updated_at || ""}</div>
+      <div className="list-row-meta">{item.source_flow_id ? `source ${item.source_flow_id}` : "manual case"} - {item.updated_at || ""}</div>
     </button>
   );
 }
