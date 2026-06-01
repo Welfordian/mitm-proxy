@@ -1,13 +1,14 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
   Ban,
-  Check,
+  Crosshair,
   Database,
   Download,
   FileJson,
   LayoutDashboard,
+  Pause,
   Play,
   Plus,
   RefreshCw,
@@ -31,6 +32,7 @@ const VIEWS = [
     ["Repeater", Repeat],
     ["Threat Scanner", ShieldAlert],
     ["Certificates", ShieldCheck],
+    ["Scopes", Crosshair],
   ] },
   { group: "Operate", items: [
     ["Blocks", Ban],
@@ -93,6 +95,36 @@ function del(path) {
   return request(path, { method: "DELETE" });
 }
 
+function scopeQuery(scopeID) {
+  if (!scopeID || scopeID === "all") return "";
+  const params = new URLSearchParams({ scope_id: scopeID });
+  return `?${params.toString()}`;
+}
+
+function isConcreteScope(scopeID) {
+  return scopeID && scopeID !== "all" && scopeID !== "__out_of_scope__";
+}
+
+function flowMatchesScope(flow, scopeID) {
+  if (!scopeID || scopeID === "all") return true;
+  if (scopeID === "__out_of_scope__") return !flow.scope_id;
+  return flow.scope_id === scopeID;
+}
+
+function flowMatchesSearch(flow, search) {
+  const term = search.trim().toLowerCase();
+  if (!term) return true;
+  return [
+    flow.method,
+    flow.host,
+    flow.url,
+    flow.protocol,
+    flow.mime_type,
+    flow.rule_id,
+    flow.status ? String(flow.status) : "",
+  ].some((value) => String(value || "").toLowerCase().includes(term));
+}
+
 function useAsync(factory, deps) {
   const [state, setState] = useState({ loading: true, data: null, error: null });
   useEffect(() => {
@@ -111,15 +143,30 @@ function App() {
   const [refreshKey, setRefreshKey] = useState(0);
   const [status, setStatus] = useState("checking");
   const [confirmed, setConfirmed] = useState(localStorage.getItem("responsibleUseConfirmed") === "true");
+  const [scopes, setScopes] = useState([]);
+  const [selectedScope, setSelectedScope] = useState(localStorage.getItem("selectedScope") || "all");
   const refresh = () => setRefreshKey((v) => v + 1);
 
+  useEffect(() => {
+    let cancelled = false;
+    api("/api/scopes")
+      .then((data) => !cancelled && setScopes(data || []))
+      .catch(() => !cancelled && setScopes([]));
+    return () => { cancelled = true; };
+  }, [refreshKey]);
+
+  useEffect(() => {
+    localStorage.setItem("selectedScope", selectedScope);
+  }, [selectedScope]);
+
   const body = useMemo(() => {
-    const props = { refreshKey, refresh, setCurrent };
+    const props = { refreshKey, refresh, setCurrent, selectedScope, scopes };
     switch (current) {
       case "Traffic": return <TrafficView {...props} />;
       case "Repeater": return <RepeaterView {...props} />;
       case "Threat Scanner": return <ThreatScannerView {...props} />;
       case "Certificates": return <CertificatesView {...props} />;
+      case "Scopes": return <ScopesView {...props} setSelectedScope={setSelectedScope} />;
       case "Blocks": return <BlocksView {...props} />;
       case "Deployments": return <DeploymentsView {...props} />;
       case "Cache": return <CacheView {...props} />;
@@ -128,13 +175,20 @@ function App() {
       case "Audit Log": return <AuditLogView {...props} />;
       default: return <DashboardView refreshKey={refreshKey} setStatus={setStatus} />;
     }
-  }, [current, refreshKey]);
+  }, [current, refreshKey, selectedScope, scopes]);
 
   return (
     <>
       <header className="topbar">
         <div className="brand"><img className="brand-mark" src="./logo-mark.svg" alt="" aria-hidden="true" />MITM Proxy Admin</div>
         <span className="env-pill">research console</span>
+        <label className="scope-select">Scope
+          <select value={selectedScope} onChange={(e) => setSelectedScope(e.target.value)}>
+            <option value="all">All traffic</option>
+            <option value="__out_of_scope__">Out of scope</option>
+            {scopes.filter((scope) => scope.enabled).map((scope) => <option key={scope.id} value={scope.id}>{scope.name}</option>)}
+          </select>
+        </label>
         <span id="status" className="status-pill">{status}</span>
       </header>
       <main className="shell">
@@ -200,12 +254,103 @@ function DashboardView({ refreshKey, setStatus }) {
   );
 }
 
-function TrafficView({ refreshKey, refresh, setCurrent }) {
+function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes }) {
+  const pageSize = 10;
   const [selected, setSelected] = useState("");
   const [detail, setDetail] = useState(null);
   const [detailError, setDetailError] = useState("");
-  const state = useAsync(() => api("/api/traffic"), [refreshKey]);
-  const flows = state.data || [];
+  const [search, setSearch] = useState("");
+  const [live, setLive] = useState(false);
+  const [flows, setFlows] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loaded, setLoaded] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [hasMore, setHasMore] = useState(true);
+  const [listError, setListError] = useState(null);
+  const loadingRef = useRef(false);
+  const requestRef = useRef(0);
+  const searchRef = useRef(search);
+  const scopeRef = useRef(selectedScope);
+
+  useEffect(() => { searchRef.current = search; }, [search]);
+  useEffect(() => { scopeRef.current = selectedScope; }, [selectedScope]);
+
+  const trafficPagePath = (offset) => {
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    if (selectedScope && selectedScope !== "all") params.set("scope_id", selectedScope);
+    if (search.trim()) params.set("q", search.trim());
+    return `/api/traffic?${params.toString()}`;
+  };
+
+  const loadPage = async (offset, replace = false) => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    const requestID = ++requestRef.current;
+    if (replace) setLoading(true);
+    else setLoadingMore(true);
+    setListError(null);
+    try {
+      const next = await api(trafficPagePath(offset));
+      if (requestID !== requestRef.current) return;
+      setFlows((current) => replace ? next : [...current, ...next]);
+      setHasMore(next.length === pageSize);
+    } catch (error) {
+      if (requestID === requestRef.current) setListError(error);
+    } finally {
+      if (requestID === requestRef.current) {
+        setLoading(false);
+        setLoaded(true);
+        setLoadingMore(false);
+        loadingRef.current = false;
+      }
+    }
+  };
+
+  useEffect(() => {
+    requestRef.current += 1;
+    loadingRef.current = false;
+    setSelected("");
+    setDetail(null);
+    setHasMore(true);
+    loadPage(0, true);
+  }, [refreshKey, selectedScope, search]);
+
+  useEffect(() => {
+    if (!live) return undefined;
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    const trafficTopics = [
+      "traffic.request.started",
+      "traffic.response.completed",
+      "traffic.tunnel.opened",
+      "traffic.blocked",
+    ];
+    let cancelled = false;
+    const handleLiveEvent = async (event) => {
+      try {
+        const payload = JSON.parse(event.data || "{}");
+        const id = payload.request_id || payload.id;
+        if (!id) return;
+        const flow = await api(`/api/traffic/${encodeURIComponent(id)}`);
+        if (cancelled || !flowMatchesScope(flow, scopeRef.current) || !flowMatchesSearch(flow, searchRef.current)) return;
+        setFlows((current) => {
+          const without = current.filter((item) => item.id !== flow.id);
+          return [flow, ...without].slice(0, Math.max(pageSize, without.length + 1));
+        });
+        setHasMore(true);
+      } catch {
+        // Live updates are opportunistic; the paged list remains the source of truth.
+      }
+    };
+    trafficTopics.forEach((topic) => source.addEventListener(topic, handleLiveEvent));
+    source.onerror = () => {
+      source.close();
+      if (!cancelled) setLive(false);
+    };
+    return () => {
+      cancelled = true;
+      source.close();
+    };
+  }, [live]);
 
   useEffect(() => {
     if (!selected && flows.length) setSelected(flows[0].id);
@@ -221,7 +366,16 @@ function TrafficView({ refreshKey, refresh, setCurrent }) {
     return () => { cancelled = true; };
   }, [selected, refreshKey]);
 
-  if (state.loading || state.error) return <PageState state={state} />;
+  const handleScroll = (event) => {
+    const el = event.currentTarget;
+    if (!hasMore || loading || loadingMore || listError) return;
+    if (el.scrollTop + el.clientHeight >= el.scrollHeight - 64) {
+      loadPage(flows.length, false);
+    }
+  };
+
+  if (!loaded && loading && !flows.length) return <PageState state={{ loading: true }} />;
+  if (!loaded && listError && !flows.length) return <PageState state={{ error: listError }} />;
   return (
     <div className="workbench">
       <aside className="workbench-sidebar">
@@ -231,33 +385,44 @@ function TrafficView({ refreshKey, refresh, setCurrent }) {
             <p>Captured requests, responses, and replay sources.</p>
           </div>
           <div className="actions">
+            <button className={live ? "primary" : "secondary"} title={live ? "Pause real-time updates" : "Enable real-time updates"} onClick={() => setLive((value) => !value)}>
+              {live ? <Pause /> : <Play />}{live ? "Pause" : "Live"}
+            </button>
             <button className="secondary" onClick={async () => { await del("/api/traffic"); setSelected(""); refresh(); }}><Trash2 />Clear</button>
-            <a className="secondary" href={`/api/traffic/export?token=${encodeURIComponent(getToken())}`}><FileJson />JSON</a>
-            <a className="secondary" href={`/api/traffic/export?format=har&token=${encodeURIComponent(getToken())}`}><Download />HAR</a>
+            <a className="secondary" download="traffic.json" href={`/api/traffic/export?token=${encodeURIComponent(getToken())}`}><FileJson />JSON</a>
+            <a className="secondary" download="traffic.har" href={`/api/traffic/export?format=har&token=${encodeURIComponent(getToken())}`}><Download />HAR</a>
+          </div>
+          <div className="list-filter">
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search method, host, URL, status..." />
           </div>
         </div>
-        <div className="workbench-list">
+        <div className="workbench-list" onScroll={handleScroll}>
           {flows.length ? flows.map((flow) => (
-            <FlowRow key={flow.id} flow={flow} active={flow.id === selected} onSelect={() => setSelected(flow.id)} />
+            <FlowRow key={flow.id} flow={flow} scopes={scopes} active={flow.id === selected} onSelect={() => setSelected(flow.id)} />
           )) : <EmptyList>No traffic captured yet.</EmptyList>}
+          {loading && flows.length > 0 && <div className="list-status">Filtering...</div>}
+          {loadingMore && <div className="list-status">Loading more...</div>}
+          {!hasMore && flows.length > 0 && <div className="list-status">End of traffic</div>}
+          {listError && flows.length > 0 && <div className="list-status error">Unable to load more.</div>}
         </div>
       </aside>
       <section className="workbench-main">
         {detailError && <div className="detail-shell error">{detailError}</div>}
         {!detail && !detailError && <EmptyDetail title="Request Detail" body="Select a captured flow to inspect headers, parameters, and body samples." />}
-        {detail && <TrafficDetail flow={detail} setCurrent={setCurrent} refresh={refresh} />}
+        {detail && <TrafficDetail flow={detail} scopes={scopes} setCurrent={setCurrent} refresh={refresh} />}
       </section>
     </div>
   );
 }
 
-function FlowRow({ flow, active, onSelect }) {
+function FlowRow({ flow, scopes, active, onSelect }) {
   const method = flow.method || "REQ";
   return (
     <button className={`list-row ${active ? "active" : ""}`} onClick={onSelect}>
       <div className="list-row-title">
         <MethodPill method={method} />
         <span>{flow.host || "(unknown host)"}</span>
+        <ScopeBadge scopeID={flow.scope_id} scopes={scopes} />
       </div>
       <div className="list-row-meta">{flow.status ? `status ${flow.status}` : "pending"} · {flow.duration_ms !== undefined ? `${flow.duration_ms} ms` : "duration unknown"} · {flow.created_at || ""}</div>
       <div className="list-row-meta">{flow.url || flow.id}</div>
@@ -265,17 +430,20 @@ function FlowRow({ flow, active, onSelect }) {
   );
 }
 
-function TrafficDetail({ flow, setCurrent, refresh }) {
+function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
   const reqHeaders = (flow.headers || []).filter((h) => h.direction === "request");
   const respHeaders = (flow.headers || []).filter((h) => h.direction === "response");
   return (
     <div className="detail-shell">
       <div className="detail-topbar">
         <div className="detail-title">
-          <h2>Request Detail</h2>
-          <div className="url-line">{flow.url || ""}</div>
+            <h2>Request Detail</h2>
+            <ScopeBadge scopeID={flow.scope_id} scopes={scopes} />
+            <div className="url-line">{flow.url || ""}</div>
         </div>
         <div className="detail-actions">
+          <a className="secondary" download={`traffic-${flow.id}.json`} href={`/api/traffic/${encodeURIComponent(flow.id)}/export?token=${encodeURIComponent(getToken())}`}><FileJson />JSON</a>
+          <a className="secondary" download={`traffic-${flow.id}.har`} href={`/api/traffic/${encodeURIComponent(flow.id)}/export?format=har&token=${encodeURIComponent(getToken())}`}><Download />HAR</a>
           <button className="secondary" onClick={async () => {
             const created = await postJSON("/api/repeater/cases", { source_flow_id: flow.id });
             sessionStorage.setItem("selectedRepeaterCase", created.id);
@@ -304,9 +472,9 @@ function TrafficDetail({ flow, setCurrent, refresh }) {
   );
 }
 
-function RepeaterView({ refreshKey, refresh }) {
+function RepeaterView({ refreshKey, refresh, selectedScope, scopes }) {
   const [selected, setSelected] = useState(sessionStorage.getItem("selectedRepeaterCase") || "");
-  const state = useAsync(() => api("/api/repeater/cases"), [refreshKey]);
+  const state = useAsync(() => api(`/api/repeater/cases${scopeQuery(selectedScope)}`), [refreshKey, selectedScope]);
   const cases = state.data || [];
   const detailState = useAsync(async () => {
     if (!selected) return null;
@@ -358,6 +526,7 @@ function RepeaterView({ refreshKey, refresh }) {
                 headers: {},
                 body: "",
                 timeout_ms: 30000,
+                scope_id: isConcreteScope(selectedScope) ? selectedScope : "",
               });
               setSelected(created.id);
               refresh();
@@ -365,13 +534,13 @@ function RepeaterView({ refreshKey, refresh }) {
           </div>
         </div>
         <div className="workbench-list">
-          {cases.length ? cases.map((c) => <RepeaterRow key={c.id} item={c} active={c.id === selected} onSelect={() => setSelected(c.id)} />) : <EmptyList>No saved cases yet.</EmptyList>}
+          {cases.length ? cases.map((c) => <RepeaterRow key={c.id} item={c} scopes={scopes} active={c.id === selected} onSelect={() => setSelected(c.id)} />) : <EmptyList>No saved cases yet.</EmptyList>}
         </div>
       </aside>
       <section className="workbench-main">
         {detailError && <div className="detail-shell error">{detailError.message}</div>}
         {!detail && !detailError && <EmptyDetail title="Request Builder" body="Create a case or clone a captured request from Traffic." />}
-        {detail && <RepeaterEditor detail={detail} refresh={refresh} clearSelected={() => setSelected("")} />}
+        {detail && <RepeaterEditor detail={detail} scopes={scopes} refresh={refresh} clearSelected={() => setSelected("")} />}
       </section>
     </div>
   );
@@ -381,12 +550,13 @@ function isNotFound(error) {
   return Boolean(error && /^404\b/.test(error.message || ""));
 }
 
-function RepeaterRow({ item, active, onSelect }) {
+function RepeaterRow({ item, scopes, active, onSelect }) {
   return (
     <button className={`list-row ${active ? "active" : ""}`} onClick={onSelect}>
       <div className="list-row-title">
         <MethodPill method={item.method || "REQ"} />
         <span>{item.name || item.id}</span>
+        <ScopeBadge scopeID={item.scope_id} scopes={scopes} />
       </div>
       <div className="list-row-meta">{item.url || ""}</div>
       <div className="list-row-meta">{item.source_flow_id ? `source ${item.source_flow_id}` : "manual case"} - {item.updated_at || ""}</div>
@@ -394,7 +564,7 @@ function RepeaterRow({ item, active, onSelect }) {
   );
 }
 
-function RepeaterEditor({ detail, refresh, clearSelected }) {
+function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
   const c = detail.case;
   const runs = detail.runs || [];
   const [form, setForm] = useState(() => ({
@@ -425,9 +595,10 @@ function RepeaterEditor({ detail, refresh, clearSelected }) {
   return (
     <div className="detail-shell">
       <div className="detail-topbar">
-        <div className="detail-title">
-          <h2>Request Builder</h2>
-          <div className="url-line">{c.name || c.id}</div>
+          <div className="detail-title">
+            <h2>Request Builder</h2>
+            <ScopeBadge scopeID={c.scope_id} scopes={scopes} />
+            <div className="url-line">{c.name || c.id}</div>
         </div>
         <div className="detail-actions">
           <button className="secondary" onClick={save}><Save />Save</button>
@@ -582,6 +753,113 @@ function CacheView({ refreshKey, refresh }) {
   return <div className="page-stack"><PageTitle title="Cache" subtitle="HTTP response cache inventory and purge controls." /><div className="grid metrics-grid"><Metric label="Enabled" value={cache.enabled ? "yes" : "no"} /><Metric label="Directory" value={cache.directory} /><Metric label="TTL" value={`${cache.ttl}s`} /><Metric label="Entries" value={cache.entries} /><Metric label="Hit rate" value={`${cache.hits || 0}/${(cache.hits || 0) + (cache.misses || 0)}`} /><Metric label="Size" value={`${cache.size} bytes`} /></div><div className="panel"><h2>Purge</h2><div className="actions"><input value={domain} onChange={(e) => setDomain(e.target.value)} placeholder="optional domain" /><button className="secondary" onClick={async () => { await postJSON("/api/cache/purge", { domain }); refresh(); }}>Purge</button></div></div><div className="panel"><h2>Cached Entries</h2><table><thead><tr><th>URL</th><th>Status</th><th>Expires</th><th>Size</th></tr></thead><tbody>{(cache.items || []).map((i) => <tr key={i.url}><td>{i.url}</td><td>{i.status}</td><td>{i.expires_at}</td><td>{i.size || 0}</td></tr>)}</tbody></table></div></div>;
 }
 
+function ScopesView({ scopes, refresh, setSelectedScope }) {
+  const [selectedID, setSelectedID] = useState(scopes[0]?.id || "");
+  const selected = scopes.find((scope) => scope.id === selectedID);
+  const emptyForm = { name: "", description: "", enabled: true, host_patterns: [], url_patterns: [], method_patterns: [] };
+  const [form, setForm] = useState(emptyForm);
+
+  useEffect(() => {
+    if (selected) {
+      setForm({
+        name: selected.name || "",
+        description: selected.description || "",
+        enabled: selected.enabled !== false,
+        host_patterns: selected.host_patterns || [],
+        url_patterns: selected.url_patterns || [],
+        method_patterns: selected.method_patterns || [],
+      });
+    } else {
+      setForm(emptyForm);
+    }
+  }, [selectedID, scopes]);
+
+  const payload = () => ({
+    ...form,
+    host_patterns: form.host_patterns,
+    url_patterns: form.url_patterns,
+    method_patterns: form.method_patterns,
+  });
+  const save = async () => {
+    if (selected) {
+      await putJSON(`/api/scopes/${selected.id}`, payload());
+    } else {
+      const created = await postJSON("/api/scopes", payload());
+      setSelectedID(created.id);
+      setSelectedScope(created.id);
+    }
+    refresh();
+  };
+
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head">
+          <div>
+            <h2>Scopes</h2>
+            <p>Target boundaries for focused research.</p>
+          </div>
+          <div className="actions"><button className="secondary" onClick={() => { setSelectedID(""); setForm(emptyForm); }}><Plus />New</button></div>
+        </div>
+        <div className="workbench-list">
+          {scopes.length ? scopes.map((scope) => (
+            <button key={scope.id} className={`list-row ${scope.id === selectedID ? "active" : ""}`} onClick={() => setSelectedID(scope.id)}>
+              <div className="list-row-title"><ScopeBadge scopeID={scope.id} scopes={scopes} /><span>{scope.name}</span></div>
+              <div className="list-row-meta">{scope.enabled ? "enabled" : "disabled"} - {(scope.host_patterns || []).length + (scope.url_patterns || []).length + (scope.method_patterns || []).length} patterns</div>
+              <div className="list-row-meta">{scope.updated_at || ""}</div>
+            </button>
+          )) : <EmptyList>No scopes yet.</EmptyList>}
+        </div>
+      </aside>
+      <section className="workbench-main">
+        <div className="detail-shell">
+          <div className="detail-topbar">
+            <div className="detail-title"><h2>{selected ? "Edit Scope" : "New Scope"}</h2><p className="muted">Use host, URL, and method patterns to classify future traffic.</p></div>
+            <div className="detail-actions">
+              <button className="primary" onClick={save}><Save />Save</button>
+              {selected && <button className="secondary danger-button" onClick={async () => { if (!confirm("Delete this scope? Related data will remain unscoped.")) return; await del(`/api/scopes/${selected.id}`); setSelectedScope("all"); setSelectedID(""); refresh(); }}><Trash2 />Delete</button>}
+            </div>
+          </div>
+          <div className="editor-stack">
+            <label>Name<input value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>Description<textarea value={form.description} onChange={(e) => setForm({ ...form, description: e.target.value })} /></label>
+            <label><input type="checkbox" checked={form.enabled} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> Enabled</label>
+            <div className="split-grid">
+              <PatternEditor title="Host Patterns" placeholder={"example.com\n*.example.com"} values={form.host_patterns} onChange={(values) => setForm({ ...form, host_patterns: values })} />
+              <PatternEditor title="URL Patterns" placeholder={"/api/\ntoken="} values={form.url_patterns} onChange={(values) => setForm({ ...form, url_patterns: values })} />
+            </div>
+            <PatternEditor title="Method Patterns" placeholder={"GET\nPOST"} values={form.method_patterns} onChange={(values) => setForm({ ...form, method_patterns: values })} />
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function PatternEditor({ title, placeholder, values, onChange }) {
+  const serializedValues = (values || []).join("\n");
+  const [text, setText] = useState(serializedValues);
+
+  useEffect(() => {
+    setText(serializedValues);
+  }, [serializedValues]);
+
+  return (
+    <div className="section-card">
+      <h3>{title}</h3>
+      <textarea
+        placeholder={placeholder}
+        value={text}
+        onChange={(e) => {
+          const next = e.target.value;
+          setText(next);
+          onChange(next.split("\n").map((value) => value.trim()).filter(Boolean));
+        }}
+      />
+    </div>
+  );
+}
+
 function SettingsView({ refreshKey, refresh }) {
   const state = useAsync(() => api("/api/settings"), [refreshKey]);
   const [form, setForm] = useState(null);
@@ -605,13 +883,13 @@ function AuditLogView({ refreshKey }) {
   return <div className="page-stack"><PageTitle title="Audit Log" subtitle="Administrative activity and system events." /><div className="panel"><table><thead><tr><th>Time</th><th>Actor</th><th>Action</th><th>Details</th></tr></thead><tbody>{state.data.map((e) => <tr key={`${e.created_at}-${e.action}`}><td>{e.created_at}</td><td>{e.actor}</td><td>{e.action}</td><td><code>{e.details ? JSON.stringify(e.details) : ""}</code></td></tr>)}</tbody></table></div></div>;
 }
 
-function ThreatScannerView({ refreshKey, refresh }) {
-  const state = useAsync(() => api("/api/threats/events"), [refreshKey]);
+function ThreatScannerView({ refreshKey, refresh, selectedScope, scopes }) {
+  const state = useAsync(() => api(`/api/threats/events${scopeQuery(selectedScope)}`), [refreshKey, selectedScope]);
   const [detail, setDetail] = useState(null);
   if (state.loading || state.error) return <PageState state={state} />;
   const data = state.data;
   const m = data.metrics;
-  return <div className="page-stack"><PageTitle title="Threat Scanner" subtitle="Detection stream, verdicts, and rule activity." /><div className="grid metrics-grid"><Metric label="Scanned requests" value={m.scanned_requests} /><Metric label="Scanned responses" value={m.scanned_responses} /><Metric label="Warnings" value={m.warnings} /><Metric label="Blocked threats" value={m.blocked_threats} /><Metric label="Quarantine" value={m.quarantined} /><Metric label="AI calls" value={m.ai_calls} /><Metric label="Average latency" value={`${Number(m.average_scan_latency_ms).toFixed(1)} ms`} /><Metric label="Timeouts" value={m.timeouts} /></div><div className="panel"><h2>Live Detections</h2><table><thead><tr><th>Time</th><th>Target</th><th>Host</th><th>Action</th><th>Score</th><th>AI</th><th>Reason</th></tr></thead><tbody>{(data.events || []).map((e) => <tr key={e.id}><td>{e.timestamp}</td><td>{e.target}</td><td>{e.host || ""}</td><td><span className={`badge ${e.verdict.action}`}>{e.verdict.action}</span></td><td>{e.local_result ? e.local_result.score : ""}</td><td>{e.ai_used ? "yes" : "no"}</td><td><button className="rowbutton" onClick={async () => setDetail(await api(`/api/threats/events/${e.id}`))}>{e.verdict.reason}</button></td></tr>)}</tbody></table></div><div className="panel"><h2>Top Rules</h2><table><thead><tr><th>ID</th><th>Name</th><th>Hits</th><th>False positives</th></tr></thead><tbody>{(m.top_rules || []).map((r) => <tr key={r.id}><td><code>{r.id}</code></td><td>{r.name}</td><td>{r.hits}</td><td>{r.false_positive_overrides}</td></tr>)}</tbody></table></div>{detail ? <ThreatDetail event={detail} refresh={refresh} /> : <div className="panel"><h2>Detection Detail</h2><p>Select a detection reason to inspect signals, AI output, and redaction details.</p></div>}</div>;
+  return <div className="page-stack"><PageTitle title="Threat Scanner" subtitle="Detection stream, verdicts, and rule activity." /><div className="grid metrics-grid"><Metric label="Scanned requests" value={m.scanned_requests} /><Metric label="Scanned responses" value={m.scanned_responses} /><Metric label="Warnings" value={m.warnings} /><Metric label="Blocked threats" value={m.blocked_threats} /><Metric label="Quarantine" value={m.quarantined} /><Metric label="AI calls" value={m.ai_calls} /><Metric label="Average latency" value={`${Number(m.average_scan_latency_ms).toFixed(1)} ms`} /><Metric label="Timeouts" value={m.timeouts} /></div><div className="panel"><h2>Live Detections</h2><table><thead><tr><th>Time</th><th>Target</th><th>Host</th><th>Scope</th><th>Action</th><th>Score</th><th>AI</th><th>Reason</th></tr></thead><tbody>{(data.events || []).map((e) => <tr key={e.id}><td>{e.timestamp}</td><td>{e.target}</td><td>{e.host || ""}</td><td><ScopeBadge scopeID={e.scope_id} scopes={scopes} /></td><td><span className={`badge ${e.verdict.action}`}>{e.verdict.action}</span></td><td>{e.local_result ? e.local_result.score : ""}</td><td>{e.ai_used ? "yes" : "no"}</td><td><button className="rowbutton" onClick={async () => setDetail(await api(`/api/threats/events/${e.id}`))}>{e.verdict.reason}</button></td></tr>)}</tbody></table></div><div className="panel"><h2>Top Rules</h2><table><thead><tr><th>ID</th><th>Name</th><th>Hits</th><th>False positives</th></tr></thead><tbody>{(m.top_rules || []).map((r) => <tr key={r.id}><td><code>{r.id}</code></td><td>{r.name}</td><td>{r.hits}</td><td>{r.false_positive_overrides}</td></tr>)}</tbody></table></div>{detail ? <ThreatDetail event={detail} refresh={refresh} /> : <div className="panel"><h2>Detection Detail</h2><p>Select a detection reason to inspect signals, AI output, and redaction details.</p></div>}</div>;
 }
 
 function ThreatDetail({ event, refresh }) {
@@ -633,6 +911,12 @@ function MethodPill({ method }) {
   return <span className={`method-pill ${METHOD_CLASS[upper] || ""}`}>{upper}</span>;
 }
 
+function ScopeBadge({ scopeID, scopes }) {
+  if (!scopeID) return <span className="scope-badge out">out of scope</span>;
+  const scope = (scopes || []).find((item) => item.id === scopeID);
+  return <span className="scope-badge">{scope ? scope.name : "scope"}</span>;
+}
+
 function EmptyList({ children }) {
   return <div className="empty-list">{children}</div>;
 }
@@ -650,7 +934,7 @@ function CodeCard({ title, value }) {
 }
 
 function TextCard({ title, value }) {
-  return <div className="section-card"><h3>{title}</h3><pre>{value}</pre></div>;
+  return <div className="section-card"><h3>{title}</h3>{value ? <pre>{value}</pre> : <div className="empty-sample">No body sample captured.</div>}</div>;
 }
 
 createRoot(document.getElementById("root")).render(<App />);

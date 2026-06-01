@@ -10,6 +10,7 @@ import (
 	"net/url"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
 
 	"mitm-proxy/internal/events"
@@ -34,6 +35,7 @@ var DashboardTables = []string{
 	"threat_rules",
 	"repeater_cases",
 	"repeater_runs",
+	"research_scopes",
 }
 
 type AuditEntry struct {
@@ -67,6 +69,7 @@ type TrafficFlow struct {
 	CacheHit   bool      `json:"cache_hit,omitempty"`
 	Blocked    bool      `json:"blocked,omitempty"`
 	RuleID     string    `json:"rule_id,omitempty"`
+	ScopeID    string    `json:"scope_id,omitempty"`
 }
 
 type HeaderRecord struct {
@@ -110,6 +113,19 @@ type RepeaterCase struct {
 	Headers      map[string][]string `json:"headers"`
 	Body         string              `json:"body"`
 	TimeoutMS    int                 `json:"timeout_ms"`
+	ScopeID      string              `json:"scope_id,omitempty"`
+}
+
+type ResearchScope struct {
+	ID             string    `json:"id"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+	Enabled        bool      `json:"enabled"`
+	HostPatterns   []string  `json:"host_patterns"`
+	URLPatterns    []string  `json:"url_patterns"`
+	MethodPatterns []string  `json:"method_patterns"`
 }
 
 type RepeaterRun struct {
@@ -130,7 +146,8 @@ type RepeaterCaseDetail struct {
 }
 
 type Store struct {
-	db *sql.DB
+	db      *sql.DB
+	writeMu sync.Mutex
 }
 
 func Open(path string) (*Store, error) {
@@ -145,14 +162,34 @@ func Open(path string) (*Store, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sqlite store: %w", err)
 	}
+	db.SetMaxOpenConns(1)
+	db.SetMaxIdleConns(1)
 
 	store := &Store{db: db}
+	if err := store.configureSQLite(context.Background()); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	if err := store.migrate(context.Background()); err != nil {
 		_ = db.Close()
 		return nil, err
 	}
 
 	return store, nil
+}
+
+func (s *Store) configureSQLite(ctx context.Context) error {
+	for _, statement := range []string{
+		`PRAGMA busy_timeout = 5000`,
+		`PRAGMA journal_mode = WAL`,
+		`PRAGMA synchronous = NORMAL`,
+		`PRAGMA foreign_keys = ON`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement); err != nil {
+			return fmt.Errorf("configure sqlite store %q: %w", statement, err)
+		}
+	}
+	return nil
 }
 
 func (s *Store) Close() error {
@@ -300,6 +337,17 @@ func (s *Store) migrate(ctx context.Context) error {
 			response_body BLOB,
 			error TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS research_scopes (
+			id TEXT PRIMARY KEY,
+			name TEXT NOT NULL,
+			description TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			host_patterns_json TEXT NOT NULL,
+			url_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -312,6 +360,9 @@ func (s *Store) migrate(ctx context.Context) error {
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "cache_hit", "INTEGER NOT NULL DEFAULT 0")
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "blocked", "INTEGER NOT NULL DEFAULT 0")
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "rule_id", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "scope_id", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "repeater_cases", "scope_id", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "threat_events", "scope_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "admin_users", "role", "TEXT NOT NULL DEFAULT 'read'")
 
 	return nil
@@ -462,6 +513,8 @@ func (s *Store) RecordEvent(ctx context.Context, event events.Event) error {
 	if s == nil {
 		return nil
 	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
 
 	switch event.Topic {
 	case events.TopicTrafficRequestStarted:
@@ -482,15 +535,38 @@ func (s *Store) RecordEvent(ctx context.Context, event events.Event) error {
 }
 
 func (s *Store) ListTraffic(ctx context.Context, limit int) ([]TrafficFlow, error) {
+	return s.ListTrafficScoped(ctx, limit, "", true)
+}
+
+func (s *Store) ListTrafficScoped(ctx context.Context, limit int, scopeID string, includeOutOfScope bool) ([]TrafficFlow, error) {
+	return s.ListTrafficScopedPage(ctx, limit, 0, scopeID, includeOutOfScope, "")
+}
+
+func (s *Store) ListTrafficScopedPage(ctx context.Context, limit, offset int, scopeID string, includeOutOfScope bool, search string) ([]TrafficFlow, error) {
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
+	if offset < 0 {
+		offset = 0
+	}
 
+	where, args := scopedWhere(scopeID, includeOutOfScope)
+	if search = strings.TrimSpace(search); search != "" {
+		searchWhere := `(LOWER(COALESCE(method, '')) LIKE ? OR LOWER(COALESCE(url, '')) LIKE ? OR LOWER(COALESCE(host, '')) LIKE ? OR CAST(COALESCE(status, 0) AS TEXT) LIKE ? OR LOWER(COALESCE(protocol, '')) LIKE ? OR LOWER(COALESCE(mime_type, '')) LIKE ? OR LOWER(COALESCE(rule_id, '')) LIKE ?)`
+		if where == "" {
+			where = " WHERE " + searchWhere
+		} else {
+			where += " AND " + searchWhere
+		}
+		term := "%" + strings.ToLower(search) + "%"
+		args = append(args, term, term, term, term, term, term, term)
+	}
+	args = append(args, limit, offset)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
 		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
-		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, '')
-		 FROM traffic_flows ORDER BY created_at DESC LIMIT ?`, limit)
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, '')
+		 FROM traffic_flows`+where+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query traffic flows: %w", err)
 	}
@@ -510,11 +586,25 @@ func (s *Store) ListTraffic(ctx context.Context, limit int) ([]TrafficFlow, erro
 	return flows, nil
 }
 
+func scopedWhere(scopeID string, includeOutOfScope bool) (string, []any) {
+	scopeID = strings.TrimSpace(scopeID)
+	if scopeID == "" {
+		return "", nil
+	}
+	if scopeID == "__out_of_scope__" {
+		return " WHERE COALESCE(scope_id, '') = ''", nil
+	}
+	if includeOutOfScope {
+		return " WHERE (scope_id = ? OR COALESCE(scope_id, '') = '')", []any{scopeID}
+	}
+	return " WHERE scope_id = ?", []any{scopeID}
+}
+
 func (s *Store) GetTraffic(ctx context.Context, id string) (TrafficFlow, bool, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
 		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
-		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, '')
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, '')
 		 FROM traffic_flows WHERE id = ?`, id)
 
 	flow, err := scanTrafficFlow(row)
@@ -670,6 +760,249 @@ func (s *Store) SetSetting(ctx context.Context, key string, value any) error {
 	return nil
 }
 
+func (s *Store) CreateResearchScope(ctx context.Context, scope ResearchScope) (ResearchScope, error) {
+	if s == nil {
+		return scope, nil
+	}
+	if scope.ID == "" {
+		scope.ID = newStoreID()
+	}
+	now := time.Now().UTC()
+	if scope.CreatedAt.IsZero() {
+		scope.CreatedAt = now
+	}
+	scope.UpdatedAt = now
+	scope = normalizeScope(scope)
+	hostJSON, urlJSON, methodJSON, err := marshalScopePatterns(scope)
+	if err != nil {
+		return ResearchScope{}, err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO research_scopes (id, name, description, created_at, updated_at, enabled, host_patterns_json, url_patterns_json, method_patterns_json)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		scope.ID, scope.Name, scope.Description, scope.CreatedAt.Format(time.RFC3339Nano), scope.UpdatedAt.Format(time.RFC3339Nano),
+		boolInt(scope.Enabled), hostJSON, urlJSON, methodJSON)
+	if err != nil {
+		return ResearchScope{}, fmt.Errorf("insert research scope: %w", err)
+	}
+	return scope, nil
+}
+
+func (s *Store) UpdateResearchScope(ctx context.Context, scope ResearchScope) (ResearchScope, error) {
+	if s == nil {
+		return scope, nil
+	}
+	scope.UpdatedAt = time.Now().UTC()
+	scope = normalizeScope(scope)
+	hostJSON, urlJSON, methodJSON, err := marshalScopePatterns(scope)
+	if err != nil {
+		return ResearchScope{}, err
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE research_scopes
+		 SET name = ?, description = ?, updated_at = ?, enabled = ?, host_patterns_json = ?, url_patterns_json = ?, method_patterns_json = ?
+		 WHERE id = ?`,
+		scope.Name, scope.Description, scope.UpdatedAt.Format(time.RFC3339Nano), boolInt(scope.Enabled), hostJSON, urlJSON, methodJSON, scope.ID)
+	if err != nil {
+		return ResearchScope{}, fmt.Errorf("update research scope: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return ResearchScope{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetResearchScope(ctx, scope.ID)
+	if err != nil || !ok {
+		return ResearchScope{}, err
+	}
+	return stored, nil
+}
+
+func (s *Store) ListResearchScopes(ctx context.Context) ([]ResearchScope, error) {
+	if s == nil {
+		return nil, nil
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, name, COALESCE(description, ''), created_at, updated_at, enabled,
+		 host_patterns_json, url_patterns_json, method_patterns_json
+		 FROM research_scopes ORDER BY updated_at DESC`)
+	if err != nil {
+		return nil, fmt.Errorf("query research scopes: %w", err)
+	}
+	defer rows.Close()
+
+	scopes := []ResearchScope{}
+	for rows.Next() {
+		scope, err := scanResearchScope(rows)
+		if err != nil {
+			return nil, err
+		}
+		scopes = append(scopes, scope)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate research scopes: %w", err)
+	}
+	return scopes, nil
+}
+
+func (s *Store) GetResearchScope(ctx context.Context, id string) (ResearchScope, bool, error) {
+	if s == nil {
+		return ResearchScope{}, false, nil
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, name, COALESCE(description, ''), created_at, updated_at, enabled,
+		 host_patterns_json, url_patterns_json, method_patterns_json
+		 FROM research_scopes WHERE id = ?`, id)
+	scope, err := scanResearchScope(row)
+	if err == sql.ErrNoRows {
+		return ResearchScope{}, false, nil
+	}
+	if err != nil {
+		return ResearchScope{}, false, err
+	}
+	return scope, true, nil
+}
+
+func (s *Store) DeleteResearchScope(ctx context.Context, id string) error {
+	if s == nil {
+		return nil
+	}
+	for _, statement := range []string{
+		`UPDATE traffic_flows SET scope_id = NULL WHERE scope_id = ?`,
+		`UPDATE repeater_cases SET scope_id = NULL WHERE scope_id = ?`,
+		`UPDATE threat_events SET scope_id = NULL WHERE scope_id = ?`,
+		`DELETE FROM research_scopes WHERE id = ?`,
+	} {
+		if _, err := s.db.ExecContext(ctx, statement, id); err != nil {
+			return fmt.Errorf("delete research scope: %w", err)
+		}
+	}
+	return nil
+}
+
+func (s *Store) AssignTrafficScope(ctx context.Context, flowID, scopeID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE traffic_flows SET scope_id = NULLIF(?, '') WHERE id = ?`, strings.TrimSpace(scopeID), flowID)
+	if err != nil {
+		return fmt.Errorf("assign traffic scope: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) AssignRepeaterScope(ctx context.Context, caseID, scopeID string) error {
+	_, err := s.db.ExecContext(ctx, `UPDATE repeater_cases SET scope_id = NULLIF(?, ''), updated_at = ? WHERE id = ?`,
+		strings.TrimSpace(scopeID), time.Now().UTC().Format(time.RFC3339Nano), caseID)
+	if err != nil {
+		return fmt.Errorf("assign repeater scope: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) MatchResearchScope(ctx context.Context, method, rawURL, host string) (string, error) {
+	scopes, err := s.ListResearchScopes(ctx)
+	if err != nil {
+		return "", err
+	}
+	for _, scope := range scopes {
+		if scope.Enabled && scopeMatches(scope, method, rawURL, host) {
+			return scope.ID, nil
+		}
+	}
+	return "", nil
+}
+
+func scopeMatches(scope ResearchScope, method, rawURL, host string) bool {
+	method = strings.ToUpper(strings.TrimSpace(method))
+	host = strings.ToLower(strings.TrimSpace(host))
+	if host == "" {
+		if parsed, err := url.Parse(rawURL); err == nil {
+			host = strings.ToLower(parsed.Hostname())
+		}
+	}
+	if len(scope.MethodPatterns) > 0 && !containsFold(scope.MethodPatterns, method) {
+		return false
+	}
+	hostMatch := len(scope.HostPatterns) == 0
+	for _, pattern := range scope.HostPatterns {
+		if matchHostPattern(pattern, host) {
+			hostMatch = true
+			break
+		}
+	}
+	urlMatch := len(scope.URLPatterns) == 0
+	for _, pattern := range scope.URLPatterns {
+		if strings.Contains(strings.ToLower(rawURL), strings.ToLower(strings.TrimSpace(pattern))) {
+			urlMatch = true
+			break
+		}
+	}
+	return hostMatch && urlMatch
+}
+
+func matchHostPattern(pattern, host string) bool {
+	pattern = strings.ToLower(strings.TrimSpace(pattern))
+	host = strings.ToLower(strings.TrimSpace(host))
+	if pattern == "" || host == "" {
+		return false
+	}
+	if strings.HasPrefix(pattern, "*.") {
+		suffix := strings.TrimPrefix(pattern, "*.")
+		return strings.HasSuffix(host, "."+suffix)
+	}
+	return host == pattern
+}
+
+func containsFold(values []string, target string) bool {
+	for _, value := range values {
+		if strings.EqualFold(strings.TrimSpace(value), target) {
+			return true
+		}
+	}
+	return false
+}
+
+func normalizeScope(scope ResearchScope) ResearchScope {
+	scope.Name = strings.TrimSpace(scope.Name)
+	scope.Description = strings.TrimSpace(scope.Description)
+	scope.HostPatterns = cleanPatterns(scope.HostPatterns, false)
+	scope.URLPatterns = cleanPatterns(scope.URLPatterns, false)
+	scope.MethodPatterns = cleanPatterns(scope.MethodPatterns, true)
+	return scope
+}
+
+func cleanPatterns(values []string, upper bool) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if upper {
+			value = strings.ToUpper(value)
+		}
+		key := strings.ToLower(value)
+		if !seen[key] {
+			seen[key] = true
+			out = append(out, value)
+		}
+	}
+	return out
+}
+
+func marshalScopePatterns(scope ResearchScope) (string, string, string, error) {
+	hostJSON, err := json.Marshal(scope.HostPatterns)
+	if err != nil {
+		return "", "", "", fmt.Errorf("marshal scope host patterns: %w", err)
+	}
+	urlJSON, err := json.Marshal(scope.URLPatterns)
+	if err != nil {
+		return "", "", "", fmt.Errorf("marshal scope url patterns: %w", err)
+	}
+	methodJSON, err := json.Marshal(scope.MethodPatterns)
+	if err != nil {
+		return "", "", "", fmt.Errorf("marshal scope method patterns: %w", err)
+	}
+	return string(hostJSON), string(urlJSON), string(methodJSON), nil
+}
+
 func (s *Store) CreateRepeaterCase(ctx context.Context, c RepeaterCase) (RepeaterCase, error) {
 	if s == nil {
 		return c, nil
@@ -690,10 +1023,10 @@ func (s *Store) CreateRepeaterCase(ctx context.Context, c RepeaterCase) (Repeate
 		return RepeaterCase{}, fmt.Errorf("marshal repeater headers: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO repeater_cases (id, created_at, updated_at, source_flow_id, name, method, url, headers_json, body, timeout_ms)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO repeater_cases (id, created_at, updated_at, source_flow_id, name, method, url, headers_json, body, timeout_ms, scope_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`,
 		c.ID, c.CreatedAt.Format(time.RFC3339Nano), c.UpdatedAt.Format(time.RFC3339Nano), c.SourceFlowID,
-		c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS)
+		c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS, strings.TrimSpace(c.ScopeID))
 	if err != nil {
 		return RepeaterCase{}, fmt.Errorf("insert repeater case: %w", err)
 	}
@@ -714,9 +1047,9 @@ func (s *Store) UpdateRepeaterCase(ctx context.Context, c RepeaterCase) (Repeate
 	}
 	result, err := s.db.ExecContext(ctx,
 		`UPDATE repeater_cases
-		 SET updated_at = ?, name = ?, method = ?, url = ?, headers_json = ?, body = ?, timeout_ms = ?
+		 SET updated_at = ?, name = ?, method = ?, url = ?, headers_json = ?, body = ?, timeout_ms = ?, scope_id = NULLIF(?, '')
 		 WHERE id = ?`,
-		c.UpdatedAt.Format(time.RFC3339Nano), c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS, c.ID)
+		c.UpdatedAt.Format(time.RFC3339Nano), c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS, strings.TrimSpace(c.ScopeID), c.ID)
 	if err != nil {
 		return RepeaterCase{}, fmt.Errorf("update repeater case: %w", err)
 	}
@@ -731,15 +1064,21 @@ func (s *Store) UpdateRepeaterCase(ctx context.Context, c RepeaterCase) (Repeate
 }
 
 func (s *Store) ListRepeaterCases(ctx context.Context, limit int) ([]RepeaterCase, error) {
+	return s.ListRepeaterCasesScoped(ctx, limit, "", true)
+}
+
+func (s *Store) ListRepeaterCasesScoped(ctx context.Context, limit int, scopeID string, includeOutOfScope bool) ([]RepeaterCase, error) {
 	if s == nil {
 		return nil, nil
 	}
 	if limit <= 0 || limit > 1000 {
 		limit = 200
 	}
+	where, args := scopedWhere(scopeID, includeOutOfScope)
+	args = append(args, limit)
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms
-		 FROM repeater_cases ORDER BY updated_at DESC LIMIT ?`, limit)
+		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms, COALESCE(scope_id, '')
+		 FROM repeater_cases`+where+` ORDER BY updated_at DESC LIMIT ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query repeater cases: %w", err)
 	}
@@ -764,7 +1103,7 @@ func (s *Store) GetRepeaterCase(ctx context.Context, id string) (RepeaterCase, b
 		return RepeaterCase{}, false, nil
 	}
 	row := s.db.QueryRowContext(ctx,
-		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms
+		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms, COALESCE(scope_id, '')
 		 FROM repeater_cases WHERE id = ?`, id)
 	c, err := scanRepeaterCase(row)
 	if err == sql.ErrNoRows {
@@ -855,7 +1194,7 @@ func scanRepeaterCase(row trafficScanner) (RepeaterCase, error) {
 	var c RepeaterCase
 	var createdAt, updatedAt, headersJSON string
 	var body []byte
-	if err := row.Scan(&c.ID, &createdAt, &updatedAt, &c.SourceFlowID, &c.Name, &c.Method, &c.URL, &headersJSON, &body, &c.TimeoutMS); err != nil {
+	if err := row.Scan(&c.ID, &createdAt, &updatedAt, &c.SourceFlowID, &c.Name, &c.Method, &c.URL, &headersJSON, &body, &c.TimeoutMS, &c.ScopeID); err != nil {
 		return RepeaterCase{}, err
 	}
 	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
@@ -868,6 +1207,23 @@ func scanRepeaterCase(row trafficScanner) (RepeaterCase, error) {
 		c.Headers = map[string][]string{}
 	}
 	return c, nil
+}
+
+func scanResearchScope(row trafficScanner) (ResearchScope, error) {
+	var scope ResearchScope
+	var createdAt, updatedAt string
+	var enabled int
+	var hostJSON, urlJSON, methodJSON string
+	if err := row.Scan(&scope.ID, &scope.Name, &scope.Description, &createdAt, &updatedAt, &enabled, &hostJSON, &urlJSON, &methodJSON); err != nil {
+		return ResearchScope{}, err
+	}
+	scope.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	scope.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	scope.Enabled = enabled != 0
+	_ = json.Unmarshal([]byte(hostJSON), &scope.HostPatterns)
+	_ = json.Unmarshal([]byte(urlJSON), &scope.URLPatterns)
+	_ = json.Unmarshal([]byte(methodJSON), &scope.MethodPatterns)
+	return normalizeScope(scope), nil
 }
 
 func scanRepeaterRun(row trafficScanner) (RepeaterRun, error) {
@@ -892,7 +1248,7 @@ func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {
 	var flow TrafficFlow
 	var createdAt string
 	var cacheHit, blocked int
-	if err := row.Scan(&flow.ID, &createdAt, &flow.Method, &flow.URL, &flow.Host, &flow.Status, &flow.Protocol, &flow.MIMEType, &flow.RemoteIP, &flow.DurationMS, &flow.Bytes, &cacheHit, &blocked, &flow.RuleID); err != nil {
+	if err := row.Scan(&flow.ID, &createdAt, &flow.Method, &flow.URL, &flow.Host, &flow.Status, &flow.Protocol, &flow.MIMEType, &flow.RemoteIP, &flow.DurationMS, &flow.Bytes, &cacheHit, &blocked, &flow.RuleID, &flow.ScopeID); err != nil {
 		return TrafficFlow{}, err
 	}
 	flow.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
@@ -902,11 +1258,18 @@ func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {
 }
 
 func (s *Store) recordTrafficStarted(ctx context.Context, event events.Event) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip)
-		 VALUES (?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET method=excluded.method, url=excluded.url, host=excluded.host, protocol=excluded.protocol, remote_ip=excluded.remote_ip`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), stringPayload(event, "method"), stringPayload(event, "url"), stringPayload(event, "host"), stringPayload(event, "protocol"), stringPayload(event, "remote_ip"))
+	method := stringPayload(event, "method")
+	rawURL := stringPayload(event, "url")
+	host := stringPayload(event, "host")
+	scopeID, err := s.MatchResearchScope(ctx, method, rawURL, host)
+	if err != nil {
+		return fmt.Errorf("match traffic scope: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET method=excluded.method, url=excluded.url, host=excluded.host, protocol=excluded.protocol, remote_ip=excluded.remote_ip, scope_id=excluded.scope_id`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID)
 	if err != nil {
 		return fmt.Errorf("record traffic start: %w", err)
 	}
@@ -917,11 +1280,18 @@ func (s *Store) recordTrafficStarted(ctx context.Context, event events.Event) er
 }
 
 func (s *Store) recordTrafficCompleted(ctx context.Context, event events.Event) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, status, mime_type, duration_ms, bytes, cache_hit)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, mime_type=excluded.mime_type, duration_ms=excluded.duration_ms, bytes=excluded.bytes, cache_hit=excluded.cache_hit`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), stringPayload(event, "method"), stringPayload(event, "url"), stringPayload(event, "host"), intPayload(event, "status"), stringPayload(event, "mime_type"), intPayload(event, "duration_ms"), intPayload(event, "bytes"), boolPayload(event, "cache_hit"))
+	method := stringPayload(event, "method")
+	rawURL := stringPayload(event, "url")
+	host := stringPayload(event, "host")
+	scopeID, err := s.MatchResearchScope(ctx, method, rawURL, host)
+	if err != nil {
+		return fmt.Errorf("match traffic scope: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, status, mime_type, duration_ms, bytes, cache_hit, scope_id)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, mime_type=excluded.mime_type, duration_ms=excluded.duration_ms, bytes=excluded.bytes, cache_hit=excluded.cache_hit, scope_id=COALESCE(excluded.scope_id, traffic_flows.scope_id)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, intPayload(event, "status"), stringPayload(event, "mime_type"), intPayload(event, "duration_ms"), intPayload(event, "bytes"), boolPayload(event, "cache_hit"), scopeID)
 	if err != nil {
 		return fmt.Errorf("record traffic completion: %w", err)
 	}
@@ -937,10 +1307,14 @@ func (s *Store) recordTunnelOpened(ctx context.Context, event events.Event) erro
 	if parsed, err := url.Parse("//" + target); err == nil {
 		host = parsed.Hostname()
 	}
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip)
-		 VALUES (?, ?, 'CONNECT', ?, ?, ?, ?)`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), target, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"))
+	scopeID, err := s.MatchResearchScope(ctx, "CONNECT", target, host)
+	if err != nil {
+		return fmt.Errorf("match tunnel scope: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id)
+		 VALUES (?, ?, 'CONNECT', ?, ?, ?, ?, NULLIF(?, ''))`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), target, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID)
 	if err != nil {
 		return fmt.Errorf("record tunnel: %w", err)
 	}
@@ -987,11 +1361,18 @@ func (s *Store) insertHeader(ctx context.Context, flowID, direction, name, value
 }
 
 func (s *Store) recordTrafficBlocked(ctx context.Context, event events.Event) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, blocked, rule_id, status)
-		 VALUES (?, ?, ?, ?, ?, 1, ?, 403)
-		 ON CONFLICT(id) DO UPDATE SET blocked=1, rule_id=excluded.rule_id, status=excluded.status`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), stringPayload(event, "method"), firstStringPayload(event, "url", "target"), stringPayload(event, "host"), stringPayload(event, "rule_id"))
+	method := stringPayload(event, "method")
+	rawURL := firstStringPayload(event, "url", "target")
+	host := stringPayload(event, "host")
+	scopeID, err := s.MatchResearchScope(ctx, method, rawURL, host)
+	if err != nil {
+		return fmt.Errorf("match blocked traffic scope: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, blocked, rule_id, status, scope_id)
+		 VALUES (?, ?, ?, ?, ?, 1, ?, 403, NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET blocked=1, rule_id=excluded.rule_id, status=excluded.status, scope_id=excluded.scope_id`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "rule_id"), scopeID)
 	if err != nil {
 		return fmt.Errorf("record blocked traffic: %w", err)
 	}
@@ -1083,6 +1464,13 @@ func boolPayload(event events.Event, key string) int {
 		return 0
 	}
 	if typed, ok := value.(bool); ok && typed {
+		return 1
+	}
+	return 0
+}
+
+func boolInt(value bool) int {
+	if value {
 		return 1
 	}
 	return 0

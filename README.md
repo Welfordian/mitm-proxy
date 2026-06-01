@@ -201,6 +201,7 @@ Initial dashboard/API coverage includes:
 - GET /api/traffic, GET /api/traffic/{id}, GET /api/traffic/stream, DELETE /api/traffic, and POST /api/traffic/{id}/replay
 - GET /api/traffic/export?format=har for HAR-style export
 - GET/POST/PUT/DELETE /api/repeater/cases and POST /api/repeater/cases/{id}/send for saved editable replay cases
+- GET/POST/PUT/DELETE /api/scopes plus scope assignment endpoints for traffic and repeater cases
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
 - GET/POST/DELETE block rules for ports, domains, and IPs
 - GET /api/deployments/current, POST /api/deployments/current/reload, GET /api/logs, GET /api/cache with cached entries and hit/miss counts, POST /api/cache/purge, and GET/PUT /api/settings
@@ -226,6 +227,14 @@ The dashboard's **Repeater** view lets security researchers clone captured HTTP 
 Captured request bodies are only prefilled when `traffic_capture.store_bodies` was enabled at capture time. If body redaction was enabled, the repeater receives the redacted sample; uncaptured bodies remain empty and can be edited manually.
 
 The legacy `POST /api/traffic/{id}/replay` endpoint remains available for one-shot replay, while the repeater is intended for repeatable request mutation and response comparison.
+
+### Research Scopes
+
+The dashboard's **Scopes** view lets researchers define named target boundaries with host, URL substring, and optional method patterns. Enabled scopes are matched automatically when traffic is captured; matching flows, cloned Repeater cases, and threat scanner events receive a single `scope_id`.
+
+The global scope selector filters Traffic, Repeater, and Threat Scanner views across all traffic, a selected enabled scope, or out-of-scope items. Deleting a scope clears related `scope_id` values without deleting captured traffic, Repeater cases, runs, or threat data.
+
+Scope filters are available on `GET /api/traffic`, `GET /api/repeater/cases`, and `GET /api/threats/events` with `scope_id=<id>` or `scope_id=__out_of_scope__`. Add `include_out_of_scope=true` to include unscoped rows beside a selected scope.
 
 ### AI Threat Scanning
 

@@ -72,6 +72,7 @@ type repeaterCaseInput struct {
 	Headers      map[string][]string `json:"headers"`
 	Body         string              `json:"body"`
 	TimeoutMS    int                 `json:"timeout_ms"`
+	ScopeID      string              `json:"scope_id"`
 }
 
 func New(options Options) *Server {
@@ -88,6 +89,8 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
 	apiMux.HandleFunc("/api/repeater/cases", s.handleRepeaterCases)
 	apiMux.HandleFunc("/api/repeater/cases/", s.handleRepeaterCaseDetail)
+	apiMux.HandleFunc("/api/scopes", s.handleScopes)
+	apiMux.HandleFunc("/api/scopes/", s.handleScopeDetail)
 	apiMux.HandleFunc("/metrics", s.handleMetrics)
 	apiMux.HandleFunc("/api/certificates/ca", s.handleCACertificate)
 	apiMux.HandleFunc("/api/certificates/ca/download", s.handleCACertificateDownload)
@@ -228,7 +231,9 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.options.Store != nil {
-		flows, err := s.options.Store.ListTraffic(r.Context(), 200)
+		scopeID, includeOutOfScope := scopeFilter(r)
+		limit, offset := paginationParams(r, 200)
+		flows, err := s.options.Store.ListTrafficScopedPage(r.Context(), limit, offset, scopeID, includeOutOfScope, r.URL.Query().Get("q"))
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -243,7 +248,167 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.options.EventBus.Recent("*", 200))
 }
 
+func scopeFilter(r *http.Request) (string, bool) {
+	include := strings.EqualFold(r.URL.Query().Get("include_out_of_scope"), "true")
+	return strings.TrimSpace(r.URL.Query().Get("scope_id")), include
+}
+
+func paginationParams(r *http.Request, defaultLimit int) (int, int) {
+	limit := defaultLimit
+	if raw := strings.TrimSpace(r.URL.Query().Get("limit")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil {
+			limit = parsed
+		}
+	}
+	if limit <= 0 {
+		limit = defaultLimit
+	}
+	if limit > 1000 {
+		limit = 1000
+	}
+	offset := 0
+	if raw := strings.TrimSpace(r.URL.Query().Get("offset")); raw != "" {
+		if parsed, err := strconv.Atoi(raw); err == nil && parsed > 0 {
+			offset = parsed
+		}
+	}
+	return limit, offset
+}
+
+func (s *Server) handleScopes(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		scopes, err := s.options.Store.ListResearchScopes(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, scopes)
+	case http.MethodPost:
+		var scope store.ResearchScope
+		if err := json.NewDecoder(r.Body).Decode(&scope); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if strings.TrimSpace(scope.Name) == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		created, err := s.options.Store.CreateResearchScope(r.Context(), scope)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "scope.create", map[string]any{"id": created.ID, "name": created.Name})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleScopeDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/scopes/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "scope not found"})
+		return
+	}
+	id := parts[0]
+	if len(parts) > 1 {
+		s.handleScopeAssignment(w, r, id, parts[1:])
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		scope, ok, err := s.options.Store.GetResearchScope(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scope not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, scope)
+	case http.MethodPut:
+		var scope store.ResearchScope
+		if err := json.NewDecoder(r.Body).Decode(&scope); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		scope.ID = id
+		if strings.TrimSpace(scope.Name) == "" {
+			http.Error(w, "name is required", http.StatusBadRequest)
+			return
+		}
+		updated, err := s.options.Store.UpdateResearchScope(r.Context(), scope)
+		if err == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "scope not found"})
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "scope.update", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteResearchScope(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "scope.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleScopeAssignment(w http.ResponseWriter, r *http.Request, scopeID string, parts []string) {
+	if r.Method != http.MethodPost || len(parts) != 3 || parts[0] != "assign" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown scope action"})
+		return
+	}
+	if _, ok, err := s.options.Store.GetResearchScope(r.Context(), scopeID); err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	} else if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "scope not found"})
+		return
+	}
+	targetID := strings.TrimSpace(parts[2])
+	switch parts[1] {
+	case "traffic":
+		if err := s.options.Store.AssignTrafficScope(r.Context(), targetID, scopeID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	case "repeater":
+		if err := s.options.Store.AssignRepeaterScope(r.Context(), targetID, scopeID); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+	default:
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown scope assignment target"})
+		return
+	}
+	s.audit(r, "scope.assign", map[string]any{"scope_id": scopeID, "target": parts[1], "target_id": targetID})
+	writeJSON(w, http.StatusOK, map[string]string{"status": "assigned"})
+}
+
 func (s *Server) handleTrafficDetail(w http.ResponseWriter, r *http.Request) {
+	if strings.HasSuffix(r.URL.Path, "/export") {
+		s.handleTrafficDetailExport(w, r)
+		return
+	}
 	if strings.HasSuffix(r.URL.Path, "/replay") {
 		s.handleTrafficReplay(w, r)
 		return
@@ -267,6 +432,28 @@ func (s *Server) handleTrafficDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+}
+
+func (s *Server) handleTrafficDetailExport(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	id := strings.Trim(strings.TrimSuffix(strings.TrimPrefix(r.URL.Path, "/api/traffic/"), "/export"), "/")
+	flow, ok, err := s.options.Store.GetTrafficDetail(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
+		return
+	}
+	if r.URL.Query().Get("format") == "har" {
+		writeDownloadJSON(w, http.StatusOK, "traffic-"+safeFilenamePart(id)+".har", trafficDetailHAR(flow))
+		return
+	}
+	writeDownloadJSON(w, http.StatusOK, "traffic-"+safeFilenamePart(id)+".json", flow)
 }
 
 func (s *Server) handleTrafficReplay(w http.ResponseWriter, r *http.Request) {
@@ -321,7 +508,8 @@ func (s *Server) handleRepeaterCases(w http.ResponseWriter, r *http.Request) {
 	}
 	switch r.Method {
 	case http.MethodGet:
-		cases, err := s.options.Store.ListRepeaterCases(r.Context(), 200)
+		scopeID, includeOutOfScope := scopeFilter(r)
+		cases, err := s.options.Store.ListRepeaterCasesScoped(r.Context(), 200, scopeID, includeOutOfScope)
 		if err != nil {
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
@@ -502,6 +690,9 @@ func (s *Server) repeaterCaseFromInput(ctx context.Context, input repeaterCaseIn
 	if input.TimeoutMS != 0 {
 		c.TimeoutMS = input.TimeoutMS
 	}
+	if input.ScopeID != "" {
+		c.ScopeID = strings.TrimSpace(input.ScopeID)
+	}
 	if c.TimeoutMS == 0 {
 		c.TimeoutMS = repeaterTimeoutMS
 	}
@@ -526,6 +717,7 @@ func repeaterCaseFromTraffic(flow store.TrafficDetail) (store.RepeaterCase, erro
 		Headers:      map[string][]string{},
 		Body:         flow.RequestBody,
 		TimeoutMS:    repeaterTimeoutMS,
+		ScopeID:      flow.ScopeID,
 	}
 	for _, header := range flow.Headers {
 		if header.Direction != "request" || skipReplayHeader(header.Name) {
@@ -663,12 +855,12 @@ func (s *Server) handleTrafficExport(w http.ResponseWriter, r *http.Request) {
 
 	if r.URL.Query().Get("format") == "har" {
 		s.audit(r, "traffic.export", map[string]any{"format": "har", "count": len(flows)})
-		writeJSON(w, http.StatusOK, trafficHAR(flows))
+		writeDownloadJSON(w, http.StatusOK, "traffic.har", trafficHAR(flows))
 		return
 	}
 
 	s.audit(r, "traffic.export", map[string]any{"format": "json", "count": len(flows)})
-	writeJSON(w, http.StatusOK, flows)
+	writeDownloadJSON(w, http.StatusOK, "traffic.json", flows)
 }
 
 func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
@@ -1280,10 +1472,43 @@ func (s *Server) handleThreatEvents(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"metrics": threats.Metrics{}, "events": []threats.Event{}})
 		return
 	}
+	eventsOut := s.scopedThreatEvents(r)
 	writeJSON(w, http.StatusOK, map[string]any{
 		"metrics": s.options.ThreatScanner.Metrics(),
-		"events":  s.options.ThreatScanner.ListEvents(100),
+		"events":  eventsOut,
 	})
+}
+
+type scopedThreatEvent struct {
+	threats.Event
+	ScopeID string `json:"scope_id,omitempty"`
+}
+
+func (s *Server) scopedThreatEvents(r *http.Request) []scopedThreatEvent {
+	eventsIn := s.options.ThreatScanner.ListEvents(100)
+	out := make([]scopedThreatEvent, 0, len(eventsIn))
+	scopeID, includeOutOfScope := scopeFilter(r)
+	for _, event := range eventsIn {
+		eventScopeID := ""
+		if s.options.Store != nil {
+			eventScopeID, _ = s.options.Store.MatchResearchScope(r.Context(), event.Method, event.URL, event.Host)
+		}
+		if scopeID == "__out_of_scope__" {
+			if eventScopeID != "" {
+				continue
+			}
+		} else if scopeID != "" {
+			if includeOutOfScope {
+				if eventScopeID != "" && eventScopeID != scopeID {
+					continue
+				}
+			} else if eventScopeID != scopeID {
+				continue
+			}
+		}
+		out = append(out, scopedThreatEvent{Event: event, ScopeID: eventScopeID})
+	}
+	return out
 }
 
 func (s *Server) handleThreatEventDetail(w http.ResponseWriter, r *http.Request) {
@@ -1638,47 +1863,79 @@ func tailFile(path string, limit int) ([]string, error) {
 func trafficHAR(flows []store.TrafficFlow) map[string]any {
 	entries := make([]map[string]any, 0, len(flows))
 	for _, flow := range flows {
-		started := flow.CreatedAt.Format(time.RFC3339Nano)
-		entry := map[string]any{
-			"startedDateTime": started,
-			"time":            flow.DurationMS,
-			"request": map[string]any{
-				"method":      flow.Method,
-				"url":         flow.URL,
-				"httpVersion": flow.Protocol,
-				"headers":     []any{},
-				"queryString": []any{},
-				"cookies":     []any{},
-				"headersSize": -1,
-				"bodySize":    -1,
-			},
-			"response": map[string]any{
-				"status":      flow.Status,
-				"statusText":  http.StatusText(flow.Status),
-				"httpVersion": flow.Protocol,
-				"headers":     []any{},
-				"cookies":     []any{},
-				"content": map[string]any{
-					"size":     flow.Bytes,
-					"mimeType": "",
-				},
-				"redirectURL":  "",
-				"headersSize":  -1,
-				"bodySize":     flow.Bytes,
-				"_cacheHit":    flow.CacheHit,
-				"_blocked":     flow.Blocked,
-				"_blockRuleID": flow.RuleID,
-			},
-			"cache": map[string]any{},
-			"timings": map[string]any{
-				"send":    0,
-				"wait":    flow.DurationMS,
-				"receive": 0,
-			},
-		}
-		entries = append(entries, entry)
+		entries = append(entries, trafficHAREntry(flow))
 	}
+	return trafficHARLog(entries)
+}
 
+func trafficDetailHAR(flow store.TrafficDetail) map[string]any {
+	entry := trafficHAREntry(flow.TrafficFlow)
+	request := entry["request"].(map[string]any)
+	response := entry["response"].(map[string]any)
+	request["headers"] = harHeaders(flow.Headers, "request")
+	request["queryString"] = harNameValues(flow.QueryParams)
+	request["cookies"] = harCookies(flow.Cookies)
+	if flow.RequestBody != "" {
+		request["postData"] = map[string]any{
+			"mimeType": "",
+			"text":     flow.RequestBody,
+		}
+		request["bodySize"] = len(flow.RequestBody)
+	}
+	response["headers"] = harHeaders(flow.Headers, "response")
+	if flow.ResponseBody != "" {
+		response["content"] = map[string]any{
+			"size":     len(flow.ResponseBody),
+			"mimeType": flow.MIMEType,
+			"text":     flow.ResponseBody,
+		}
+		response["bodySize"] = len(flow.ResponseBody)
+	}
+	return trafficHARLog([]map[string]any{entry})
+}
+
+func trafficHAREntry(flow store.TrafficFlow) map[string]any {
+	started := flow.CreatedAt.Format(time.RFC3339Nano)
+	return map[string]any{
+		"startedDateTime": started,
+		"time":            flow.DurationMS,
+		"request": map[string]any{
+			"method":      flow.Method,
+			"url":         flow.URL,
+			"httpVersion": flow.Protocol,
+			"headers":     []any{},
+			"queryString": []any{},
+			"cookies":     []any{},
+			"headersSize": -1,
+			"bodySize":    -1,
+		},
+		"response": map[string]any{
+			"status":      flow.Status,
+			"statusText":  http.StatusText(flow.Status),
+			"httpVersion": flow.Protocol,
+			"headers":     []any{},
+			"cookies":     []any{},
+			"content": map[string]any{
+				"size":     flow.Bytes,
+				"mimeType": flow.MIMEType,
+			},
+			"redirectURL":  "",
+			"headersSize":  -1,
+			"bodySize":     flow.Bytes,
+			"_cacheHit":    flow.CacheHit,
+			"_blocked":     flow.Blocked,
+			"_blockRuleID": flow.RuleID,
+		},
+		"cache": map[string]any{},
+		"timings": map[string]any{
+			"send":    0,
+			"wait":    flow.DurationMS,
+			"receive": 0,
+		},
+	}
+}
+
+func trafficHARLog(entries []map[string]any) map[string]any {
 	return map[string]any{
 		"log": map[string]any{
 			"version": "1.2",
@@ -1689,6 +1946,35 @@ func trafficHAR(flows []store.TrafficFlow) map[string]any {
 			"entries": entries,
 		},
 	}
+}
+
+func harHeaders(headers []store.HeaderRecord, direction string) []map[string]string {
+	out := []map[string]string{}
+	for _, header := range headers {
+		if header.Direction != direction {
+			continue
+		}
+		out = append(out, map[string]string{"name": header.Name, "value": header.Value})
+	}
+	return out
+}
+
+func harNameValues(values map[string][]string) []map[string]string {
+	out := []map[string]string{}
+	for name, vals := range values {
+		for _, value := range vals {
+			out = append(out, map[string]string{"name": name, "value": value})
+		}
+	}
+	return out
+}
+
+func harCookies(values map[string]string) []map[string]string {
+	out := []map[string]string{}
+	for name, value := range values {
+		out = append(out, map[string]string{"name": name, "value": value})
+	}
+	return out
 }
 
 func GenerateToken() (string, error) {
@@ -1712,4 +1998,33 @@ func writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(value)
+}
+
+func writeDownloadJSON(w http.ResponseWriter, status int, filename string, value any) {
+	w.Header().Set("Content-Disposition", fmt.Sprintf(`attachment; filename="%s"`, safeFilenamePart(filename)))
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	writeJSON(w, status, value)
+}
+
+func safeFilenamePart(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "download"
+	}
+	var b strings.Builder
+	for _, r := range value {
+		if r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '.' || r == '-' || r == '_' {
+			b.WriteRune(r)
+			continue
+		}
+		b.WriteByte('-')
+	}
+	out := strings.Trim(b.String(), ".-")
+	if out == "" {
+		return "download"
+	}
+	if len(out) > 120 {
+		return out[:120]
+	}
+	return out
 }
