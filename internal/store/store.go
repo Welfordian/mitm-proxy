@@ -2,7 +2,9 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"net/url"
@@ -30,6 +32,8 @@ var DashboardTables = []string{
 	"threat_events",
 	"threat_verdict_cache",
 	"threat_rules",
+	"repeater_cases",
+	"repeater_runs",
 }
 
 type AuditEntry struct {
@@ -93,6 +97,36 @@ type TrafficStats struct {
 	Total    int64 `json:"total"`
 	Blocked  int64 `json:"blocked"`
 	CacheHit int64 `json:"cache_hit"`
+}
+
+type RepeaterCase struct {
+	ID           string              `json:"id"`
+	CreatedAt    time.Time           `json:"created_at"`
+	UpdatedAt    time.Time           `json:"updated_at"`
+	SourceFlowID string              `json:"source_flow_id,omitempty"`
+	Name         string              `json:"name"`
+	Method       string              `json:"method"`
+	URL          string              `json:"url"`
+	Headers      map[string][]string `json:"headers"`
+	Body         string              `json:"body"`
+	TimeoutMS    int                 `json:"timeout_ms"`
+}
+
+type RepeaterRun struct {
+	ID              string              `json:"id"`
+	CaseID          string              `json:"case_id"`
+	CreatedAt       time.Time           `json:"created_at"`
+	Status          int                 `json:"status,omitempty"`
+	DurationMS      int64               `json:"duration_ms,omitempty"`
+	Bytes           int64               `json:"bytes,omitempty"`
+	ResponseHeaders map[string][]string `json:"response_headers,omitempty"`
+	ResponseBody    string              `json:"response_body,omitempty"`
+	Error           string              `json:"error,omitempty"`
+}
+
+type RepeaterCaseDetail struct {
+	Case RepeaterCase  `json:"case"`
+	Runs []RepeaterRun `json:"runs"`
 }
 
 type Store struct {
@@ -242,6 +276,29 @@ func (s *Store) migrate(ctx context.Context) error {
 			action TEXT NOT NULL,
 			enabled INTEGER NOT NULL,
 			created_at TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS repeater_cases (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			source_flow_id TEXT,
+			name TEXT NOT NULL,
+			method TEXT NOT NULL,
+			url TEXT NOT NULL,
+			headers_json TEXT NOT NULL,
+			body BLOB,
+			timeout_ms INTEGER NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS repeater_runs (
+			id TEXT PRIMARY KEY,
+			case_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			status INTEGER,
+			duration_ms INTEGER,
+			bytes INTEGER,
+			response_headers_json TEXT NOT NULL,
+			response_body BLOB,
+			error TEXT
 		)`,
 	}
 
@@ -613,8 +670,222 @@ func (s *Store) SetSetting(ctx context.Context, key string, value any) error {
 	return nil
 }
 
+func (s *Store) CreateRepeaterCase(ctx context.Context, c RepeaterCase) (RepeaterCase, error) {
+	if s == nil {
+		return c, nil
+	}
+	if c.ID == "" {
+		c.ID = newStoreID()
+	}
+	now := time.Now().UTC()
+	if c.CreatedAt.IsZero() {
+		c.CreatedAt = now
+	}
+	c.UpdatedAt = now
+	if c.Headers == nil {
+		c.Headers = map[string][]string{}
+	}
+	headers, err := json.Marshal(c.Headers)
+	if err != nil {
+		return RepeaterCase{}, fmt.Errorf("marshal repeater headers: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO repeater_cases (id, created_at, updated_at, source_flow_id, name, method, url, headers_json, body, timeout_ms)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		c.ID, c.CreatedAt.Format(time.RFC3339Nano), c.UpdatedAt.Format(time.RFC3339Nano), c.SourceFlowID,
+		c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS)
+	if err != nil {
+		return RepeaterCase{}, fmt.Errorf("insert repeater case: %w", err)
+	}
+	return c, nil
+}
+
+func (s *Store) UpdateRepeaterCase(ctx context.Context, c RepeaterCase) (RepeaterCase, error) {
+	if s == nil {
+		return c, nil
+	}
+	c.UpdatedAt = time.Now().UTC()
+	if c.Headers == nil {
+		c.Headers = map[string][]string{}
+	}
+	headers, err := json.Marshal(c.Headers)
+	if err != nil {
+		return RepeaterCase{}, fmt.Errorf("marshal repeater headers: %w", err)
+	}
+	result, err := s.db.ExecContext(ctx,
+		`UPDATE repeater_cases
+		 SET updated_at = ?, name = ?, method = ?, url = ?, headers_json = ?, body = ?, timeout_ms = ?
+		 WHERE id = ?`,
+		c.UpdatedAt.Format(time.RFC3339Nano), c.Name, c.Method, c.URL, string(headers), []byte(c.Body), c.TimeoutMS, c.ID)
+	if err != nil {
+		return RepeaterCase{}, fmt.Errorf("update repeater case: %w", err)
+	}
+	if rows, _ := result.RowsAffected(); rows == 0 {
+		return RepeaterCase{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetRepeaterCase(ctx, c.ID)
+	if err != nil || !ok {
+		return RepeaterCase{}, err
+	}
+	return stored, nil
+}
+
+func (s *Store) ListRepeaterCases(ctx context.Context, limit int) ([]RepeaterCase, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 1000 {
+		limit = 200
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms
+		 FROM repeater_cases ORDER BY updated_at DESC LIMIT ?`, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query repeater cases: %w", err)
+	}
+	defer rows.Close()
+
+	cases := []RepeaterCase{}
+	for rows.Next() {
+		c, err := scanRepeaterCase(rows)
+		if err != nil {
+			return nil, err
+		}
+		cases = append(cases, c)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repeater cases: %w", err)
+	}
+	return cases, nil
+}
+
+func (s *Store) GetRepeaterCase(ctx context.Context, id string) (RepeaterCase, bool, error) {
+	if s == nil {
+		return RepeaterCase{}, false, nil
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, created_at, updated_at, COALESCE(source_flow_id, ''), name, method, url, headers_json, COALESCE(body, ''), timeout_ms
+		 FROM repeater_cases WHERE id = ?`, id)
+	c, err := scanRepeaterCase(row)
+	if err == sql.ErrNoRows {
+		return RepeaterCase{}, false, nil
+	}
+	if err != nil {
+		return RepeaterCase{}, false, err
+	}
+	return c, true, nil
+}
+
+func (s *Store) DeleteRepeaterCase(ctx context.Context, id string) error {
+	if s == nil {
+		return nil
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM repeater_runs WHERE case_id = ?`, id); err != nil {
+		return fmt.Errorf("delete repeater runs: %w", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM repeater_cases WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete repeater case: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) AddRepeaterRun(ctx context.Context, run RepeaterRun) (RepeaterRun, error) {
+	if s == nil {
+		return run, nil
+	}
+	if run.ID == "" {
+		run.ID = newStoreID()
+	}
+	if run.CreatedAt.IsZero() {
+		run.CreatedAt = time.Now().UTC()
+	}
+	if run.ResponseHeaders == nil {
+		run.ResponseHeaders = map[string][]string{}
+	}
+	headers, err := json.Marshal(run.ResponseHeaders)
+	if err != nil {
+		return RepeaterRun{}, fmt.Errorf("marshal repeater response headers: %w", err)
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO repeater_runs (id, case_id, created_at, status, duration_ms, bytes, response_headers_json, response_body, error)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		run.ID, run.CaseID, run.CreatedAt.Format(time.RFC3339Nano), run.Status, run.DurationMS, run.Bytes,
+		string(headers), []byte(run.ResponseBody), run.Error)
+	if err != nil {
+		return RepeaterRun{}, fmt.Errorf("insert repeater run: %w", err)
+	}
+	return run, nil
+}
+
+func (s *Store) ListRepeaterRuns(ctx context.Context, caseID string, limit int) ([]RepeaterRun, error) {
+	if s == nil {
+		return nil, nil
+	}
+	if limit <= 0 || limit > 200 {
+		limit = 50
+	}
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, case_id, created_at, COALESCE(status, 0), COALESCE(duration_ms, 0), COALESCE(bytes, 0),
+		 response_headers_json, COALESCE(response_body, ''), COALESCE(error, '')
+		 FROM repeater_runs WHERE case_id = ? ORDER BY created_at DESC LIMIT ?`, caseID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("query repeater runs: %w", err)
+	}
+	defer rows.Close()
+
+	runs := []RepeaterRun{}
+	for rows.Next() {
+		run, err := scanRepeaterRun(rows)
+		if err != nil {
+			return nil, err
+		}
+		runs = append(runs, run)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate repeater runs: %w", err)
+	}
+	return runs, nil
+}
+
 type trafficScanner interface {
 	Scan(dest ...any) error
+}
+
+func scanRepeaterCase(row trafficScanner) (RepeaterCase, error) {
+	var c RepeaterCase
+	var createdAt, updatedAt, headersJSON string
+	var body []byte
+	if err := row.Scan(&c.ID, &createdAt, &updatedAt, &c.SourceFlowID, &c.Name, &c.Method, &c.URL, &headersJSON, &body, &c.TimeoutMS); err != nil {
+		return RepeaterCase{}, err
+	}
+	c.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	c.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	c.Body = string(body)
+	if headersJSON != "" {
+		_ = json.Unmarshal([]byte(headersJSON), &c.Headers)
+	}
+	if c.Headers == nil {
+		c.Headers = map[string][]string{}
+	}
+	return c, nil
+}
+
+func scanRepeaterRun(row trafficScanner) (RepeaterRun, error) {
+	var run RepeaterRun
+	var createdAt, headersJSON string
+	var body []byte
+	if err := row.Scan(&run.ID, &run.CaseID, &createdAt, &run.Status, &run.DurationMS, &run.Bytes, &headersJSON, &body, &run.Error); err != nil {
+		return RepeaterRun{}, err
+	}
+	run.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	run.ResponseBody = string(body)
+	if headersJSON != "" {
+		_ = json.Unmarshal([]byte(headersJSON), &run.ResponseHeaders)
+	}
+	if run.ResponseHeaders == nil {
+		run.ResponseHeaders = map[string][]string{}
+	}
+	return run, nil
 }
 
 func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {
@@ -815,4 +1086,12 @@ func boolPayload(event events.Event, key string) int {
 		return 1
 	}
 	return 0
+}
+
+func newStoreID() string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return fmt.Sprintf("%d", time.Now().UnixNano())
+	}
+	return hex.EncodeToString(b[:])
 }

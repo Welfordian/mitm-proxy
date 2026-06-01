@@ -6,3 +6,4 @@ dashboard.db
 dashboard.db-*
 threats.log
 internal/threats/threats.log
+internal/admin/ui/node_modules/

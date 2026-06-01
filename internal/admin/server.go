@@ -1,11 +1,11 @@
 package admin
 
 import (
-	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/x509"
+	"database/sql"
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
@@ -15,6 +15,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -56,6 +57,23 @@ type Server struct {
 	server  *http.Server
 }
 
+const (
+	repeaterBodyLimit    = 65536
+	repeaterTimeoutMS    = 30000
+	repeaterMinTimeoutMS = 1000
+	repeaterMaxTimeoutMS = 120000
+)
+
+type repeaterCaseInput struct {
+	SourceFlowID string              `json:"source_flow_id"`
+	Name         string              `json:"name"`
+	Method       string              `json:"method"`
+	URL          string              `json:"url"`
+	Headers      map[string][]string `json:"headers"`
+	Body         string              `json:"body"`
+	TimeoutMS    int                 `json:"timeout_ms"`
+}
+
 func New(options Options) *Server {
 	mux := http.NewServeMux()
 	s := &Server{options: options}
@@ -68,6 +86,8 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/traffic/export", s.handleTrafficExport)
 	apiMux.HandleFunc("/api/traffic/", s.handleTrafficDetail)
 	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
+	apiMux.HandleFunc("/api/repeater/cases", s.handleRepeaterCases)
+	apiMux.HandleFunc("/api/repeater/cases/", s.handleRepeaterCaseDetail)
 	apiMux.HandleFunc("/metrics", s.handleMetrics)
 	apiMux.HandleFunc("/api/certificates/ca", s.handleCACertificate)
 	apiMux.HandleFunc("/api/certificates/ca/download", s.handleCACertificateDownload)
@@ -275,39 +295,359 @@ func (s *Server) handleTrafficReplay(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	body := strings.NewReader(flow.RequestBody)
-	req, err := http.NewRequestWithContext(r.Context(), flow.Method, flow.URL, body)
+	c, err := repeaterCaseFromTraffic(flow)
 	if err != nil {
 		http.Error(w, err.Error(), http.StatusBadRequest)
 		return
 	}
-	for _, header := range flow.Headers {
-		if header.Direction != "request" || strings.EqualFold(header.Name, "Host") || strings.EqualFold(header.Name, "Content-Length") {
-			continue
+	run := sendRepeaterCase(r.Context(), c)
+	if run.Error != "" {
+		http.Error(w, run.Error, http.StatusBadGateway)
+		return
+	}
+	s.audit(r, "traffic.replay", map[string]any{"id": id, "status": run.Status})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":             run.Status,
+		"headers":            run.ResponseHeaders,
+		"body":               strings.TrimSpace(run.ResponseBody),
+		"truncated_at_bytes": repeaterBodyLimit,
+	})
+}
+
+func (s *Server) handleRepeaterCases(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		cases, err := s.options.Store.ListRepeaterCases(r.Context(), 200)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
 		}
-		req.Header.Add(header.Name, header.Value)
+		writeJSON(w, http.StatusOK, cases)
+	case http.MethodPost:
+		var input repeaterCaseInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		c, err := s.repeaterCaseFromInput(r.Context(), input, "")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		created, err := s.options.Store.CreateRepeaterCase(r.Context(), c)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "repeater.case.create", map[string]any{"id": created.ID, "source_flow_id": created.SourceFlowID})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRepeaterCaseDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/repeater/cases/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 0 || parts[0] == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+		return
+	}
+	id := parts[0]
+	if len(parts) > 1 {
+		if parts[1] == "send" {
+			s.handleRepeaterSend(w, r, id)
+			return
+		}
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "unknown repeater action"})
+		return
 	}
 
-	client := &http.Client{Timeout: 30 * time.Second}
-	resp, err := client.Do(req)
-	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
+	switch r.Method {
+	case http.MethodGet:
+		c, ok, err := s.options.Store.GetRepeaterCase(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+			return
+		}
+		runs, err := s.options.Store.ListRepeaterRuns(r.Context(), id, 50)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, store.RepeaterCaseDetail{Case: c, Runs: runs})
+	case http.MethodPut:
+		var input repeaterCaseInput
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		c, err := s.repeaterCaseFromInput(r.Context(), input, id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		updated, err := s.options.Store.UpdateRepeaterCase(r.Context(), c)
+		if err == sql.ErrNoRows {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "repeater.case.update", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteRepeaterCase(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "repeater.case.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleRepeaterSend(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
+	}
+	c, ok, err := s.options.Store.GetRepeaterCase(r.Context(), id)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "repeater case not found"})
+		return
+	}
+	if err := validateRepeaterCase(c); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	run := sendRepeaterCase(r.Context(), c)
+	stored, err := s.options.Store.AddRepeaterRun(r.Context(), run)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "repeater.case.send", map[string]any{"id": id, "run_id": stored.ID, "status": stored.Status, "error": stored.Error})
+	writeJSON(w, http.StatusOK, stored)
+}
+
+func (s *Server) repeaterCaseFromInput(ctx context.Context, input repeaterCaseInput, id string) (store.RepeaterCase, error) {
+	var c store.RepeaterCase
+	if id != "" {
+		existing, ok, err := s.options.Store.GetRepeaterCase(ctx, id)
+		if err != nil {
+			return store.RepeaterCase{}, err
+		}
+		if !ok {
+			return store.RepeaterCase{}, fmt.Errorf("repeater case not found")
+		}
+		c = existing
+	} else if strings.TrimSpace(input.SourceFlowID) != "" {
+		flow, ok, err := s.options.Store.GetTrafficDetail(ctx, strings.TrimSpace(input.SourceFlowID))
+		if err != nil {
+			return store.RepeaterCase{}, err
+		}
+		if !ok {
+			return store.RepeaterCase{}, fmt.Errorf("source traffic flow not found")
+		}
+		cloned, err := repeaterCaseFromTraffic(flow)
+		if err != nil {
+			return store.RepeaterCase{}, err
+		}
+		c = cloned
+	} else {
+		c = store.RepeaterCase{
+			Headers:   map[string][]string{},
+			TimeoutMS: repeaterTimeoutMS,
+		}
+	}
+
+	if input.SourceFlowID != "" && c.SourceFlowID == "" {
+		c.SourceFlowID = strings.TrimSpace(input.SourceFlowID)
+	}
+	if input.Name != "" || id != "" {
+		c.Name = strings.TrimSpace(input.Name)
+	}
+	if input.Method != "" || id != "" {
+		c.Method = strings.ToUpper(strings.TrimSpace(input.Method))
+	}
+	if input.URL != "" || id != "" {
+		c.URL = strings.TrimSpace(input.URL)
+	}
+	if input.Headers != nil {
+		c.Headers = input.Headers
+	}
+	if input.Body != "" || id != "" || c.SourceFlowID == "" {
+		c.Body = input.Body
+	}
+	if input.TimeoutMS != 0 {
+		c.TimeoutMS = input.TimeoutMS
+	}
+	if c.TimeoutMS == 0 {
+		c.TimeoutMS = repeaterTimeoutMS
+	}
+	if c.Name == "" {
+		c.Name = defaultRepeaterName(c.Method, c.URL)
+	}
+	if c.Headers == nil {
+		c.Headers = map[string][]string{}
+	}
+	if err := validateRepeaterCase(c); err != nil {
+		return store.RepeaterCase{}, err
+	}
+	return c, nil
+}
+
+func repeaterCaseFromTraffic(flow store.TrafficDetail) (store.RepeaterCase, error) {
+	c := store.RepeaterCase{
+		SourceFlowID: flow.ID,
+		Name:         defaultRepeaterName(flow.Method, flow.URL),
+		Method:       strings.ToUpper(strings.TrimSpace(flow.Method)),
+		URL:          strings.TrimSpace(flow.URL),
+		Headers:      map[string][]string{},
+		Body:         flow.RequestBody,
+		TimeoutMS:    repeaterTimeoutMS,
+	}
+	for _, header := range flow.Headers {
+		if header.Direction != "request" || skipReplayHeader(header.Name) {
+			continue
+		}
+		c.Headers[header.Name] = append(c.Headers[header.Name], header.Value)
+	}
+	if err := validateRepeaterCase(c); err != nil {
+		return store.RepeaterCase{}, err
+	}
+	return c, nil
+}
+
+func validateRepeaterCase(c store.RepeaterCase) error {
+	method := strings.ToUpper(strings.TrimSpace(c.Method))
+	if method == "" {
+		return fmt.Errorf("method is required")
+	}
+	if method == http.MethodConnect {
+		return fmt.Errorf("CONNECT cannot be sent from the repeater")
+	}
+	parsed, err := url.Parse(strings.TrimSpace(c.URL))
+	if err != nil || parsed.Scheme == "" || parsed.Host == "" {
+		return fmt.Errorf("valid absolute URL is required")
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https")
+	}
+	if c.TimeoutMS < repeaterMinTimeoutMS || c.TimeoutMS > repeaterMaxTimeoutMS {
+		return fmt.Errorf("timeout_ms must be between %d and %d", repeaterMinTimeoutMS, repeaterMaxTimeoutMS)
+	}
+	return nil
+}
+
+func sendRepeaterCase(ctx context.Context, c store.RepeaterCase) store.RepeaterRun {
+	run := store.RepeaterRun{
+		CaseID:          c.ID,
+		CreatedAt:       time.Now().UTC(),
+		ResponseHeaders: map[string][]string{},
+	}
+	start := time.Now()
+	req, err := buildRepeaterRequest(ctx, c)
+	if err != nil {
+		run.Error = err.Error()
+		return run
+	}
+	client := &http.Client{Timeout: time.Duration(c.TimeoutMS) * time.Millisecond}
+	resp, err := client.Do(req)
+	run.DurationMS = time.Since(start).Milliseconds()
+	if err != nil {
+		run.Error = err.Error()
+		return run
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(io.LimitReader(resp.Body, 65536))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, repeaterBodyLimit+1))
 	if err != nil {
-		http.Error(w, err.Error(), http.StatusBadGateway)
-		return
+		run.Error = err.Error()
+		return run
 	}
-	s.audit(r, "traffic.replay", map[string]any{"id": id, "status": resp.StatusCode})
-	writeJSON(w, http.StatusOK, map[string]any{
-		"status":             resp.StatusCode,
-		"headers":            resp.Header,
-		"body":               string(bytes.TrimSpace(respBody)),
-		"truncated_at_bytes": 65536,
-	})
+	if len(body) > repeaterBodyLimit {
+		body = body[:repeaterBodyLimit]
+	}
+	run.Status = resp.StatusCode
+	run.Bytes = int64(len(body))
+	run.ResponseHeaders = map[string][]string(resp.Header.Clone())
+	run.ResponseBody = string(body)
+	return run
+}
+
+func buildRepeaterRequest(ctx context.Context, c store.RepeaterCase) (*http.Request, error) {
+	if err := validateRepeaterCase(c); err != nil {
+		return nil, err
+	}
+	req, err := http.NewRequestWithContext(ctx, strings.ToUpper(strings.TrimSpace(c.Method)), strings.TrimSpace(c.URL), strings.NewReader(c.Body))
+	if err != nil {
+		return nil, err
+	}
+	for name, values := range c.Headers {
+		if skipReplayHeader(name) {
+			continue
+		}
+		for _, value := range values {
+			req.Header.Add(name, value)
+		}
+	}
+	return req, nil
+}
+
+func skipReplayHeader(name string) bool {
+	if strings.EqualFold(name, "Host") || strings.EqualFold(name, "Content-Length") {
+		return true
+	}
+	for _, header := range hopByHopReplayHeaders {
+		if strings.EqualFold(name, header) {
+			return true
+		}
+	}
+	return false
+}
+
+var hopByHopReplayHeaders = []string{
+	"Connection",
+	"Proxy-Connection",
+	"Keep-Alive",
+	"Proxy-Authenticate",
+	"Proxy-Authorization",
+	"TE",
+	"Trailer",
+	"Transfer-Encoding",
+	"Upgrade",
+}
+
+func defaultRepeaterName(method, rawURL string) string {
+	parsed, err := url.Parse(rawURL)
+	if err == nil && parsed.Host != "" {
+		return strings.TrimSpace(strings.ToUpper(method) + " " + parsed.Host + parsed.EscapedPath())
+	}
+	if strings.TrimSpace(method) == "" && strings.TrimSpace(rawURL) == "" {
+		return "Untitled repeater case"
+	}
+	return strings.TrimSpace(strings.ToUpper(method) + " " + rawURL)
 }
 
 func (s *Server) handleTrafficExport(w http.ResponseWriter, r *http.Request) {

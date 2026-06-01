@@ -1,5 +1,9 @@
  # Go MITM Proxy
 
+<p align="center">
+  <img src="docs/assets/logo-mark.svg" alt="MITM Proxy Admin logo mark" width="64" height="64">
+</p>
+
  A lightweight, developer-friendly Man‑in‑the‑Middle (MITM) HTTP/HTTPS proxy written in Go. It supports HTTP/1.1 and HTTP/2, CONNECT tunneling, WebSocket tunneling (ws/wss), on‑disk response caching with flexible filters, and live config reloading.
 
  ## Badges
@@ -7,6 +11,15 @@
  ![Go](https://img.shields.io/badge/Go-1.25+-00ADD8?logo=go)
  ![Platform](https://img.shields.io/badge/Platforms-linux%20|%20macOS%20|%20windows-informational)
  ![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen)
+
+## Admin Dashboard Preview
+
+![MITM Proxy Admin dashboard overview](docs/assets/admin-dashboard.png)
+
+![MITM Proxy Admin traffic workbench](docs/assets/admin-traffic.png)
+
+![MITM Proxy Admin repeater workbench](docs/assets/admin-repeater.png)
+
 
 
  ## Overview
@@ -187,6 +200,7 @@ Initial dashboard/API coverage includes:
 - GET /api/audit
 - GET /api/traffic, GET /api/traffic/{id}, GET /api/traffic/stream, DELETE /api/traffic, and POST /api/traffic/{id}/replay
 - GET /api/traffic/export?format=har for HAR-style export
+- GET/POST/PUT/DELETE /api/repeater/cases and POST /api/repeater/cases/{id}/send for saved editable replay cases
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
 - GET/POST/DELETE block rules for ports, domains, and IPs
 - GET /api/deployments/current, POST /api/deployments/current/reload, GET /api/logs, GET /api/cache with cached entries and hit/miss counts, POST /api/cache/purge, and GET/PUT /api/settings
@@ -196,6 +210,22 @@ Initial dashboard/API coverage includes:
 
 The dashboard includes a first-run responsible-use confirmation. The CA private key is never exposed through the admin API.
 Dashboard state is stored in SQLite at `dashboard.db` by default. Settings changed through the dashboard are applied immediately and written back to the configured JSON file, or to `config.json` when the proxy was started from defaults.
+
+The admin frontend is a Vite/React app in `internal/admin/ui`. Its production build is emitted to `internal/admin/ui/dist` and embedded into the Go binary. To update the dashboard assets:
+
+```bash
+cd internal/admin/ui
+npm install
+npm run build
+```
+
+### Research Repeater
+
+The dashboard's **Repeater** view lets security researchers clone captured HTTP traffic into saved editable cases. A case stores the method, URL, headers, body sample, timeout, and optional source traffic flow ID. Each send stores a run with status, duration, response headers, a capped response body sample, and any upstream error.
+
+Captured request bodies are only prefilled when `traffic_capture.store_bodies` was enabled at capture time. If body redaction was enabled, the repeater receives the redacted sample; uncaptured bodies remain empty and can be edited manually.
+
+The legacy `POST /api/traffic/{id}/replay` endpoint remains available for one-shot replay, while the repeater is intended for repeatable request mutation and response comparison.
 
 ### AI Threat Scanning
 
