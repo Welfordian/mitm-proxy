@@ -43,7 +43,6 @@ const VIEWS = [
     ["Deployments", Server],
     ["Cache", Database],
     ["Settings", Settings],
-    ["Admin Users", Users],
     ["Audit Log", ScrollText],
   ] },
 ];
@@ -61,7 +60,6 @@ const VIEW_SLUGS = {
   Deployments: "deployments",
   Cache: "cache",
   Settings: "settings",
-  "Admin Users": "admin-users",
   "Audit Log": "audit-log",
 };
 
@@ -245,7 +243,6 @@ function App() {
       case "Deployments": return <DeploymentsView {...props} />;
       case "Cache": return <CacheView {...props} />;
       case "Settings": return <SettingsView {...props} />;
-      case "Admin Users": return <AdminUsersView {...props} />;
       case "Audit Log": return <AuditLogView {...props} />;
       default: return <DashboardView refreshKey={refreshKey} setStatus={setStatus} />;
     }
@@ -1402,13 +1399,6 @@ function SettingsView({ refreshKey, refresh }) {
       </div>
     </div>
   );
-}
-
-function AdminUsersView({ refreshKey, refresh }) {
-  const state = useAsync(() => api("/api/admin/users"), [refreshKey]);
-  const [form, setForm] = useState({ name: "", role: "read" });
-  if (state.loading || state.error) return <PageState state={state} />;
-  return <div className="page-stack"><PageTitle title="Admin Users" subtitle="Named dashboard users for audit and operational roles." /><div className="panel"><div className="actions"><input placeholder="name" value={form.name} onChange={(e) => setForm({ ...form, name: e.target.value })} /><select value={form.role} onChange={(e) => setForm({ ...form, role: e.target.value })}><option value="read">Read only</option><option value="admin">Admin</option></select><button className="secondary" onClick={async () => { await postJSON("/api/admin/users", form); setForm({ name: "", role: "read" }); refresh(); }}><Plus />Add</button></div><table><thead><tr><th>Name</th><th>Role</th><th>Created</th><th /></tr></thead><tbody>{state.data.map((u) => <tr key={u.id}><td>{u.name}</td><td><span className={`badge ${u.role === "admin" ? "warn" : "allow"}`}>{u.role}</span></td><td>{u.created_at}</td><td><button className="rowbutton" onClick={async () => { await del(`/api/admin/users/${u.id}`); refresh(); }}>Delete</button></td></tr>)}</tbody></table><p className="muted">Bearer tokens still enforce API access; this list records named dashboard users and roles.</p></div></div>;
 }
 
 function AuditLogView({ refreshKey }) {

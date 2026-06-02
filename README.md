@@ -219,7 +219,6 @@ Initial dashboard/API coverage includes:
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
 - GET/POST/DELETE block rules for ports, domains, and IPs
 - GET /api/deployments/current, POST /api/deployments/current/reload, GET /api/logs, GET /api/cache with cached entries and hit/miss counts, POST /api/cache/purge, and GET/PUT /api/settings
-- GET/POST/DELETE /api/admin/users for named admin/read-only user role records
 - GET /api/threats/events, GET /api/threats/stream, GET /api/threats/config, POST /api/threats/test, and threat override endpoints
 - GET /metrics for Prometheus-compatible process/admin/threat counters
 
