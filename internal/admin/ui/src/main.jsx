@@ -12,6 +12,7 @@ import {
   Pause,
   Play,
   Plus,
+  Power,
   RefreshCw,
   Repeat,
   Save,
@@ -32,6 +33,7 @@ const VIEWS = [
     ["Dashboard", LayoutDashboard],
     ["Traffic", Activity],
     ["Repeater", Repeat],
+    ["Pentest Toolkit", Crosshair],
     ["AI Copilot", Bot],
     ["Threat Scanner", ShieldAlert],
     ["Certificates", ShieldCheck],
@@ -51,6 +53,7 @@ const VIEW_SLUGS = {
   Dashboard: "",
   Traffic: "traffic",
   Repeater: "repeater",
+  "Pentest Toolkit": "pentest-toolkit",
   "AI Copilot": "ai-copilot",
   "Threat Scanner": "threat-scanner",
   Certificates: "certificates",
@@ -234,6 +237,7 @@ function App() {
     switch (current) {
       case "Traffic": return <TrafficView {...props} />;
       case "Repeater": return <RepeaterView {...props} />;
+      case "Pentest Toolkit": return <PentestToolkitView {...props} />;
       case "AI Copilot": return <AICopilotView {...props} />;
       case "Threat Scanner": return <ThreatScannerView {...props} />;
       case "Certificates": return <CertificatesView {...props} />;
@@ -244,7 +248,7 @@ function App() {
       case "Cache": return <CacheView {...props} />;
       case "Settings": return <SettingsView {...props} />;
       case "Audit Log": return <AuditLogView {...props} />;
-      default: return <DashboardView refreshKey={refreshKey} setStatus={setStatus} />;
+      default: return <DashboardView refreshKey={refreshKey} setStatus={setStatus} setCurrent={setCurrent} />;
     }
   }, [current, refreshKey, selectedScope, scopes]);
 
@@ -296,14 +300,23 @@ function App() {
 
 function PageState({ state }) {
   if (state.loading) return <div className="panel muted">Loading...</div>;
-  if (state.error) return <div className="panel error">Unable to load: <code>{state.error.message}</code></div>;
+  if (state.error) return <div className="panel error">Unable to load: <code>{state.error.message || String(state.error)}</code></div>;
   return null;
 }
 
-function DashboardView({ refreshKey, setStatus }) {
+function DashboardView({ refreshKey, setStatus, setCurrent }) {
+  const [restartState, setRestartState] = useState({ status: "idle", message: "" });
   const state = useAsync(async () => {
-    const [health, version] = await Promise.all([api("/api/health"), api("/api/version")]);
-    return { health, version };
+    const [health, version, trafficStats, recentTraffic, audit, threats, cache] = await Promise.all([
+      api("/api/health"),
+      api("/api/version"),
+      api("/api/traffic/stats"),
+      api("/api/traffic?limit=5"),
+      api("/api/audit"),
+      api("/api/threats/events"),
+      api("/api/cache?limit=1"),
+    ]);
+    return { health, version, trafficStats, recentTraffic, audit, threats, cache };
   }, [refreshKey]);
 
   useEffect(() => {
@@ -311,18 +324,128 @@ function DashboardView({ refreshKey, setStatus }) {
   }, [state.data, setStatus]);
 
   if (state.loading || state.error) return <PageState state={state} />;
-  const { health, version } = state.data;
+  const { health, version, trafficStats, recentTraffic, audit, threats, cache } = state.data;
+  const totalTraffic = Number(trafficStats.total || 0);
+  const cacheHits = Number(trafficStats.cache_hit || cache?.hits || 0);
+  const uptime = formatDuration(Number(health.uptime_seconds || 0));
+  const reloadConfig = async () => {
+    await post("/api/deployments/current/reload");
+    location.reload();
+  };
+  const restartProxy = async () => {
+    setRestartState({ status: "pending", message: "Restart requested. Waiting for the process to respond..." });
+    try {
+      await post("/api/deployments/current/restart");
+      setRestartState({ status: "success", message: "Restart requested successfully." });
+    } catch (error) {
+      setRestartState({ status: "error", message: error.message });
+    }
+  };
   return (
     <div className="page-stack">
-      <PageTitle title="Dashboard" subtitle="Live proxy posture and administrative runtime." />
+      <PageTitle
+        title="Dashboard"
+        subtitle={`Proxy control plane - last sync ${new Date(health.time).toLocaleTimeString()}`}
+        actions={(
+          <>
+            <button className="secondary" onClick={reloadConfig}><RefreshCw />Reload config</button>
+            <button className="primary" onClick={restartProxy}><Power />Restart proxy</button>
+          </>
+        )}
+      />
       <div className="grid metrics-grid">
         <Metric label="Proxy" value={health.proxy.listen_addr} />
-        <Metric label="MITM" value={health.proxy.mitm_enabled ? "enabled" : "disabled"} />
+        <Metric label="MITM" value={health.proxy.mitm_enabled ? "enabled" : "disabled"} tone={health.proxy.mitm_enabled ? "success" : ""} />
         <Metric label="Admin" value={health.admin.addr} />
         <Metric label="Version" value={version.version} />
       </div>
+      <div className="grid metrics-grid">
+        <Metric label="Requests captured" value={totalTraffic} />
+        <Metric label="Threats blocked" value={threats.metrics?.blocked_threats || trafficStats.blocked || 0} />
+        <Metric label="Cache hit rate" value={`${cacheHits} / ${totalTraffic}`} />
+        <Metric label="Uptime" value={uptime} hint="hh:mm" />
+      </div>
+      {restartState.message && <div className={`restart-feedback ${restartState.status}`}>{restartState.message}</div>}
+      <div className="dashboard-panels">
+        <SummaryPanel title="Recent traffic" action={<button className="rowbutton" onClick={() => setCurrent("Traffic")}>View all</button>}>
+          <TrafficSummaryList flows={recentTraffic || []} />
+        </SummaryPanel>
+        <SummaryPanel title="Audit log" action={<button className="rowbutton" onClick={() => setCurrent("Audit Log")}>Open</button>}>
+          <AuditSummaryList entries={(audit || []).slice(0, 4)} />
+        </SummaryPanel>
+      </div>
     </div>
   );
+}
+
+function SummaryPanel({ title, action, children }) {
+  return (
+    <div className="panel summary-panel">
+      <div className="summary-head">
+        <h2>{title}</h2>
+        {action}
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function TrafficSummaryList({ flows }) {
+  if (!flows.length) return <div className="empty-list">No traffic captured yet.</div>;
+  return (
+    <div className="summary-list">
+      {flows.map((flow) => (
+        <div className="summary-row traffic-summary-row" key={flow.id}>
+          <MethodPill method={flow.method || "REQ"} />
+          <div className="summary-main">
+            <strong>{flow.host || "(unknown host)"}</strong>
+            <span>{flow.url || flow.id}</span>
+          </div>
+          <span className={`status-code ${statusCodeClass(flow.status)}`}>{flow.status || "..."}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function AuditSummaryList({ entries }) {
+  if (!entries.length) return <div className="empty-list">No audit events recorded yet.</div>;
+  return (
+    <table className="summary-table">
+      <thead><tr><th>Time</th><th>Actor</th><th>Action</th></tr></thead>
+      <tbody>
+        {entries.map((entry, index) => (
+          <tr key={`${entry.created_at}-${entry.action}-${index}`}>
+            <td>{timeOnly(entry.created_at)}</td>
+            <td><span className={`scope-badge ${entry.actor === "system" ? "" : "out"}`}>{entry.actor || "admin"}</span></td>
+            <td><code>{entry.action}</code></td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
+  );
+}
+
+function statusCodeClass(status) {
+  const code = Number(status || 0);
+  if (code >= 200 && code < 300) return "ok";
+  if (code >= 300 && code < 400) return "redirect";
+  if (code >= 400) return "error";
+  return "";
+}
+
+function timeOnly(value) {
+  if (!value) return "";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return String(value).slice(11, 19) || String(value);
+  return date.toLocaleTimeString([], { hour12: false });
+}
+
+function formatDuration(totalSeconds) {
+  const safe = Math.max(0, Math.floor(totalSeconds || 0));
+  const hours = Math.floor(safe / 3600);
+  const minutes = Math.floor((safe % 3600) / 60);
+  return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
 function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes }) {
@@ -860,6 +983,183 @@ function safeParseJSON(value) {
 
 function humanLabel(value) {
   return String(value || "").replace(/_/g, " ").replace(/\b\w/g, (char) => char.toUpperCase());
+}
+
+function PentestToolkitView({ refreshKey, refresh, selectedScope, scopes, setCurrent }) {
+  const [selectedMap, setSelectedMap] = useState("");
+  const [tab, setTab] = useState("endpoints");
+  const [selectedItem, setSelectedItem] = useState(null);
+  const [severity, setSeverity] = useState("all");
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const mapsState = useAsync(() => api(`/api/pentest/maps${scopeQuery(selectedScope)}`), [refreshKey, selectedScope]);
+  const maps = mapsState.data || [];
+  const detailState = useAsync(async () => selectedMap ? api(`/api/pentest/maps/${encodeURIComponent(selectedMap)}`) : null, [selectedMap, refreshKey]);
+  const detail = detailState.data;
+  const endpoints = detail?.endpoints || [];
+  const parameters = detail?.parameters || [];
+  const observations = (detail?.observations || []).filter((item) => severity === "all" || item.severity === severity);
+
+  useEffect(() => {
+    if (!selectedMap && maps.length) setSelectedMap(maps[0].id);
+    if (selectedMap && maps.length && !maps.some((m) => m.id === selectedMap)) setSelectedMap(maps[0].id);
+  }, [maps, selectedMap]);
+
+  const rebuild = async () => {
+    setBusy(true);
+    setError("");
+    try {
+      const created = await postJSON("/api/pentest/maps/rebuild", {
+        scope_id: selectedScope && selectedScope !== "all" ? selectedScope : "",
+        include_out_of_scope: selectedScope === "all",
+        name: pentestMapName(selectedScope, scopes),
+      });
+      setSelectedMap(created.map.id);
+      setSelectedItem(null);
+      refresh();
+    } catch (err) {
+      setError(err.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const cloneEndpoint = async (endpoint) => {
+    if (!detail?.map?.id || !endpoint?.id) return;
+    const created = await postJSON(`/api/pentest/maps/${encodeURIComponent(detail.map.id)}/endpoints/${encodeURIComponent(endpoint.id)}/clone`, {});
+    sessionStorage.setItem("selectedRepeaterCase", created.id);
+    setCurrent("Repeater");
+  };
+
+  if (mapsState.loading) return <PageState state={mapsState} />;
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head">
+          <div className="workbench-head-row">
+            <div><h2>Pentest Toolkit</h2><p>Passive target maps from captured traffic.</p></div>
+            <div className="actions"><button className="secondary" disabled={busy} onClick={rebuild}><RefreshCw />{busy ? "Rebuilding..." : "Rebuild Map"}</button></div>
+          </div>
+          {error && <p className="error-text">{error}</p>}
+        </div>
+        <div className="workbench-list">
+          {maps.length ? maps.map((m) => (
+            <button key={m.id} className={`list-row ${m.id === selectedMap ? "active" : ""}`} onClick={() => { setSelectedMap(m.id); setSelectedItem(null); }}>
+              <div className="list-row-title"><Crosshair /><span>{m.name}</span><ScopeBadge scopeID={m.scope_id} scopes={scopes} /></div>
+              <div className="list-row-meta">{m.endpoint_count} endpoints · {m.parameter_count} params · {m.source_flow_count} flows</div>
+              <div className="list-row-meta">{m.updated_at}</div>
+            </button>
+          )) : <EmptyList>No target maps yet. Capture traffic, then rebuild a map.</EmptyList>}
+        </div>
+      </aside>
+      <section className="workbench-main">
+        {!selectedMap && <EmptyDetail title="Target Mapper" body="Rebuild a map to inventory endpoints, parameters, cookies, and passive hints from captured traffic." />}
+        {selectedMap && detailState.loading && <PageState state={detailState} />}
+        {selectedMap && detailState.error && <PageState state={detailState} />}
+        {detail && (
+          <div className="detail-shell">
+            <div className="detail-topbar">
+              <div className="detail-title"><h2>{detail.map.name}</h2><ScopeBadge scopeID={detail.map.scope_id} scopes={scopes} /><div className="url-line">Updated {detail.map.updated_at}</div></div>
+              <div className="detail-actions"><button className="secondary danger-button" onClick={async () => { await del(`/api/pentest/maps/${detail.map.id}`); setSelectedMap(""); setSelectedItem(null); refresh(); }}><Trash2 />Delete</button></div>
+            </div>
+            <div className="grid metrics-grid compact">
+              <Metric label="Flows" value={detail.map.source_flow_count} />
+              <Metric label="Endpoints" value={detail.map.endpoint_count} />
+              <Metric label="Parameters" value={detail.map.parameter_count} />
+              <Metric label="Hints" value={detail.observations.length} />
+            </div>
+            <div className="tabs">
+              {["endpoints", "parameters", "cookies", "hints"].map((name) => <button key={name} className={tab === name ? "active" : ""} onClick={() => { setTab(name); setSelectedItem(null); }}>{name}</button>)}
+            </div>
+            {tab === "endpoints" && <PentestEndpointTable endpoints={endpoints} parameters={parameters} selected={selectedItem} onSelect={setSelectedItem} />}
+            {tab === "parameters" && <PentestParameterTable title="Parameters" parameters={parameters} selected={selectedItem} onSelect={setSelectedItem} />}
+            {tab === "cookies" && <PentestParameterTable title="Cookies" parameters={parameters.filter((p) => p.location === "cookie")} selected={selectedItem} onSelect={setSelectedItem} />}
+            {tab === "hints" && <PentestObservationTable observations={observations} severity={severity} setSeverity={setSeverity} selected={selectedItem} onSelect={setSelectedItem} />}
+            <PentestDetail item={selectedItem} endpoints={endpoints} onClone={cloneEndpoint} />
+          </div>
+        )}
+      </section>
+    </div>
+  );
+}
+
+function PentestEndpointTable({ endpoints, parameters, selected, onSelect }) {
+  const { visibleItems, hasMore, loadMore } = usePagedRows(endpoints);
+  return (
+    <div className="section-card">
+      <h3>Endpoints</h3>
+      <table>
+        <thead><tr><th>Method</th><th>Host</th><th>Path</th><th>Status</th><th>Types</th><th>Params</th></tr></thead>
+        <tbody>{endpoints.length ? visibleItems.map((e) => <tr key={e.id} className={selected?.id === e.id ? "selected-row" : ""} onClick={() => onSelect({ type: "endpoint", ...e })}><td><MethodPill method={e.method} /></td><td>{e.host}</td><td><code>{e.normalized_path}</code></td><td>{Object.keys(e.status_summary || {}).join(", ")}</td><td>{(e.content_types || []).join(", ")}</td><td>{parameters.filter((p) => p.endpoint_id === e.id).length}</td></tr>) : <tr><td colSpan="6">No endpoints mapped.</td></tr>}</tbody>
+      </table>
+      <LoadMoreRows visible={visibleItems.length} total={endpoints.length} hasMore={hasMore} onLoadMore={loadMore} />
+    </div>
+  );
+}
+
+function PentestParameterTable({ title, parameters, selected, onSelect }) {
+  const { visibleItems, hasMore, loadMore } = usePagedRows(parameters);
+  return (
+    <div className="section-card">
+      <h3>{title}</h3>
+      <table>
+        <thead><tr><th>Name</th><th>Location</th><th>Types</th><th>Endpoints</th><th>Flags</th></tr></thead>
+        <tbody>{parameters.length ? visibleItems.map((p) => <tr key={p.id} className={selected?.id === p.id ? "selected-row" : ""} onClick={() => onSelect({ type: "parameter", ...p })}><td><code>{p.name}</code></td><td>{p.location}</td><td>{(p.observed_types || []).join(", ")}</td><td>{p.endpoint_count}</td><td>{p.interesting && <span className="badge warn">interesting</span>} {p.reflected && <span className="badge allow">reflected</span>}</td></tr>) : <tr><td colSpan="5">No {String(title || "parameters").toLowerCase()} mapped.</td></tr>}</tbody>
+      </table>
+      <LoadMoreRows visible={visibleItems.length} total={parameters.length} hasMore={hasMore} onLoadMore={loadMore} />
+    </div>
+  );
+}
+
+function PentestObservationTable({ observations, severity, setSeverity, selected, onSelect }) {
+  const { visibleItems, hasMore, loadMore } = usePagedRows(observations);
+  return (
+    <div className="section-card">
+      <div className="detail-topbar"><h3>Passive Hints</h3><select value={severity} onChange={(e) => setSeverity(e.target.value)}><option value="all">all severities</option><option value="high">high</option><option value="medium">medium</option><option value="low">low</option><option value="info">info</option></select></div>
+      <table>
+        <thead><tr><th>Severity</th><th>Kind</th><th>Title</th><th>Flow</th></tr></thead>
+        <tbody>{observations.length ? visibleItems.map((o) => <tr key={o.id} className={selected?.id === o.id ? "selected-row" : ""} onClick={() => onSelect({ type: "observation", ...o })}><td><span className={`badge ${o.severity === "medium" || o.severity === "high" ? "warn" : "allow"}`}>{o.severity}</span></td><td>{o.kind}</td><td>{o.title}</td><td><code>{o.representative_flow_id}</code></td></tr>) : <tr><td colSpan="4">No passive hints for this filter.</td></tr>}</tbody>
+      </table>
+      <LoadMoreRows visible={visibleItems.length} total={observations.length} hasMore={hasMore} onLoadMore={loadMore} />
+    </div>
+  );
+}
+
+function usePagedRows(items, pageSize = 10) {
+  const [visibleCount, setVisibleCount] = useState(pageSize);
+  const rows = items || [];
+  const rowSignature = rows.map((row) => row.id || row.name || row.title || JSON.stringify(row)).join("\x1f");
+  useEffect(() => {
+    setVisibleCount(pageSize);
+  }, [rowSignature, pageSize]);
+  return {
+    visibleItems: rows.slice(0, visibleCount),
+    hasMore: visibleCount < rows.length,
+    loadMore: () => setVisibleCount((count) => count + pageSize),
+  };
+}
+
+function LoadMoreRows({ visible, total, hasMore, onLoadMore }) {
+  if (!total || total <= 10) return null;
+  return (
+    <div className="table-footer">
+      <span>Showing {visible} of {total}</span>
+      {hasMore && <button className="secondary" onClick={onLoadMore}>Load 10 More</button>}
+    </div>
+  );
+}
+
+function PentestDetail({ item, endpoints, onClone }) {
+  if (!item) return <EmptyDetail title="Pentest Detail" body="Select an endpoint, parameter, cookie, or passive hint to inspect evidence." />;
+  const endpoint = item.type === "endpoint" ? item : endpoints.find((e) => e.id === item.endpoint_id);
+  return <div className="section-card"><div className="detail-topbar"><h3>{item.type === "endpoint" ? item.normalized_path : item.title || item.name}</h3>{endpoint && <button className="secondary" onClick={() => onClone(endpoint)}><Repeat />Clone to Repeater</button>}</div><CodeCard title="Evidence" value={item} /></div>;
+}
+
+function pentestMapName(selectedScope, scopes) {
+  if (!selectedScope || selectedScope === "all") return "All traffic map";
+  if (selectedScope === "__out_of_scope__") return "Out of scope map";
+  const scope = (scopes || []).find((s) => s.id === selectedScope);
+  return `${scope?.name || "Scope"} map`;
 }
 
 function AICopilotView({ refreshKey, refresh, selectedScope, scopes, setCurrent }) {
@@ -1422,12 +1722,12 @@ function ThreatDetail({ event, refresh }) {
   return <div className="panel"><div className="detail-topbar"><h2>Detection Detail</h2><div className="actions"><button className="secondary" onClick={() => override("false-positive")}>Mark false positive</button><button className="secondary" onClick={() => override("allow")}>Allow</button><button className="secondary" onClick={() => override("block")}>Block</button><button className="secondary" onClick={() => override("quarantine")}>Quarantine</button></div></div><div className="grid metrics-grid compact"><Metric label="Final action" value={event.verdict.action} /><Metric label="Local score" value={event.local_result.score} /><Metric label="AI used" value={event.ai_used ? "yes" : "no"} /><Metric label="Latency" value={`${event.scan_latency_ms} ms`} /></div><h3>Signals</h3><table><thead><tr><th>ID</th><th>Name</th><th>Category</th><th>Severity</th><th>Weight</th><th>Evidence</th></tr></thead><tbody>{signals.map((s) => <tr key={s.id}><td><code>{s.id}</code></td><td>{s.name}</td><td>{s.category}</td><td>{s.severity}</td><td>{s.weight}</td><td><code>{JSON.stringify(s.evidence || {})}</code></td></tr>)}</tbody></table><CodeCard title="AI Verdict" value={event.ai_verdict || {}} /><CodeCard title="Redaction" value={(event.evidence && event.evidence.redaction) || {}} /><CodeCard title="Quarantine" value={(event.evidence && event.evidence.quarantine) || {}} /></div>;
 }
 
-function PageTitle({ title, subtitle }) {
-  return <div className="page-title"><div><h1>{title}</h1><p>{subtitle}</p></div></div>;
+function PageTitle({ title, subtitle, actions }) {
+  return <div className="page-title"><div><h1>{title}</h1><p>{subtitle}</p></div>{actions && <div className="page-actions">{actions}</div>}</div>;
 }
 
-function Metric({ label, value }) {
-  return <div className="metric"><span>{label}</span><strong>{value}</strong></div>;
+function Metric({ label, value, tone, hint }) {
+  return <div className={`metric ${tone ? `metric-${tone}` : ""}`}><span>{label}</span><strong>{value}{hint && <> <small>{hint}</small></>}</strong></div>;
 }
 
 function MethodPill({ method }) {

@@ -43,6 +43,10 @@ var DashboardTables = []string{
 	"ai_notes",
 	"proxy_users",
 	"proxy_acl_rules",
+	"pentest_maps",
+	"pentest_endpoints",
+	"pentest_parameters",
+	"pentest_observations",
 }
 
 type AuditEntry struct {
@@ -184,6 +188,71 @@ type RepeaterRun struct {
 type RepeaterCaseDetail struct {
 	Case RepeaterCase  `json:"case"`
 	Runs []RepeaterRun `json:"runs"`
+}
+
+type PentestMap struct {
+	ID                string    `json:"id"`
+	ScopeID           string    `json:"scope_id,omitempty"`
+	CreatedAt         time.Time `json:"created_at"`
+	UpdatedAt         time.Time `json:"updated_at"`
+	Name              string    `json:"name"`
+	SourceFlowCount   int       `json:"source_flow_count"`
+	EndpointCount     int       `json:"endpoint_count"`
+	ParameterCount    int       `json:"parameter_count"`
+	IncludeOutOfScope bool      `json:"include_out_of_scope,omitempty"`
+}
+
+type PentestEndpoint struct {
+	ID                   string         `json:"id"`
+	MapID                string         `json:"map_id"`
+	Method               string         `json:"method"`
+	Scheme               string         `json:"scheme"`
+	Host                 string         `json:"host"`
+	Path                 string         `json:"path"`
+	NormalizedPath       string         `json:"normalized_path"`
+	StatusSummary        map[string]int `json:"status_summary"`
+	ContentTypes         []string       `json:"content_types"`
+	HasAuth              bool           `json:"has_auth"`
+	HasCookies           bool           `json:"has_cookies"`
+	HasRequestBody       bool           `json:"has_request_body"`
+	HasResponseBody      bool           `json:"has_response_body"`
+	CacheHit             bool           `json:"cache_hit"`
+	ProxyUsers           []string       `json:"proxy_users,omitempty"`
+	ParameterCount       int            `json:"parameter_count"`
+	RepresentativeFlowID string         `json:"representative_flow_id,omitempty"`
+}
+
+type PentestParameter struct {
+	ID                   string   `json:"id"`
+	MapID                string   `json:"map_id"`
+	EndpointID           string   `json:"endpoint_id"`
+	Name                 string   `json:"name"`
+	Location             string   `json:"location"`
+	ObservedTypes        []string `json:"observed_types"`
+	Examples             []string `json:"examples,omitempty"`
+	EndpointCount        int      `json:"endpoint_count"`
+	Reflected            bool     `json:"reflected"`
+	Interesting          bool     `json:"interesting"`
+	RepresentativeFlowID string   `json:"representative_flow_id,omitempty"`
+}
+
+type PentestObservation struct {
+	ID                   string          `json:"id"`
+	MapID                string          `json:"map_id"`
+	EndpointID           string          `json:"endpoint_id,omitempty"`
+	Kind                 string          `json:"kind"`
+	Severity             string          `json:"severity"`
+	Title                string          `json:"title"`
+	Summary              string          `json:"summary"`
+	Evidence             json.RawMessage `json:"evidence_json,omitempty"`
+	RepresentativeFlowID string          `json:"representative_flow_id,omitempty"`
+}
+
+type PentestMapDetail struct {
+	Map          PentestMap           `json:"map"`
+	Endpoints    []PentestEndpoint    `json:"endpoints"`
+	Parameters   []PentestParameter   `json:"parameters"`
+	Observations []PentestObservation `json:"observations"`
 }
 
 type AINote struct {
@@ -691,6 +760,60 @@ func (s *Store) migrate(ctx context.Context) error {
 			created_at TEXT NOT NULL,
 			updated_at TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS pentest_maps (
+			id TEXT PRIMARY KEY,
+			scope_id TEXT,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			name TEXT NOT NULL,
+			source_flow_count INTEGER NOT NULL,
+			endpoint_count INTEGER NOT NULL,
+			parameter_count INTEGER NOT NULL,
+			include_out_of_scope INTEGER NOT NULL DEFAULT 0
+		)`,
+		`CREATE TABLE IF NOT EXISTS pentest_endpoints (
+			id TEXT PRIMARY KEY,
+			map_id TEXT NOT NULL,
+			method TEXT NOT NULL,
+			scheme TEXT NOT NULL,
+			host TEXT NOT NULL,
+			path TEXT NOT NULL,
+			normalized_path TEXT NOT NULL,
+			status_summary_json TEXT NOT NULL,
+			content_types_json TEXT NOT NULL,
+			has_auth INTEGER NOT NULL,
+			has_cookies INTEGER NOT NULL,
+			has_request_body INTEGER NOT NULL,
+			has_response_body INTEGER NOT NULL,
+			cache_hit INTEGER NOT NULL,
+			proxy_users_json TEXT NOT NULL,
+			parameter_count INTEGER NOT NULL,
+			representative_flow_id TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS pentest_parameters (
+			id TEXT PRIMARY KEY,
+			map_id TEXT NOT NULL,
+			endpoint_id TEXT NOT NULL,
+			name TEXT NOT NULL,
+			location TEXT NOT NULL,
+			observed_types_json TEXT NOT NULL,
+			examples_json TEXT NOT NULL,
+			endpoint_count INTEGER NOT NULL,
+			reflected INTEGER NOT NULL,
+			interesting INTEGER NOT NULL,
+			representative_flow_id TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS pentest_observations (
+			id TEXT PRIMARY KEY,
+			map_id TEXT NOT NULL,
+			endpoint_id TEXT,
+			kind TEXT NOT NULL,
+			severity TEXT NOT NULL,
+			title TEXT NOT NULL,
+			summary TEXT NOT NULL,
+			evidence_json TEXT NOT NULL,
+			representative_flow_id TEXT
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -896,6 +1019,254 @@ func (s *Store) DeleteAINote(ctx context.Context, id string) error {
 		return fmt.Errorf("delete ai note: %w", err)
 	}
 	return nil
+}
+
+func (s *Store) SavePentestMap(ctx context.Context, m PentestMap, endpoints []PentestEndpoint, parameters []PentestParameter, observations []PentestObservation) (PentestMap, error) {
+	if s == nil {
+		return PentestMap{}, nil
+	}
+	now := time.Now().UTC()
+	if strings.TrimSpace(m.ID) == "" {
+		m.ID = newStoreID()
+	}
+	if m.CreatedAt.IsZero() {
+		m.CreatedAt = now
+	}
+	m.UpdatedAt = now
+	if strings.TrimSpace(m.Name) == "" {
+		m.Name = "Pentest map"
+	}
+	m.SourceFlowCount = maxInt(m.SourceFlowCount, 0)
+	m.EndpointCount = len(endpoints)
+	m.ParameterCount = len(parameters)
+
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return PentestMap{}, err
+	}
+	defer tx.Rollback()
+
+	if _, err := tx.ExecContext(ctx,
+		`INSERT INTO pentest_maps (id, scope_id, created_at, updated_at, name, source_flow_count, endpoint_count, parameter_count, include_out_of_scope)
+		 VALUES (?, NULLIF(?, ''), ?, ?, ?, ?, ?, ?, ?)`,
+		m.ID, strings.TrimSpace(m.ScopeID), m.CreatedAt.Format(time.RFC3339Nano), m.UpdatedAt.Format(time.RFC3339Nano), m.Name, m.SourceFlowCount, m.EndpointCount, m.ParameterCount, boolInt(m.IncludeOutOfScope)); err != nil {
+		return PentestMap{}, fmt.Errorf("insert pentest map: %w", err)
+	}
+
+	for _, endpoint := range endpoints {
+		if strings.TrimSpace(endpoint.ID) == "" {
+			endpoint.ID = newStoreID()
+		}
+		endpoint.MapID = m.ID
+		statusJSON, _ := json.Marshal(endpoint.StatusSummary)
+		contentTypesJSON, _ := json.Marshal(endpoint.ContentTypes)
+		proxyUsersJSON, _ := json.Marshal(endpoint.ProxyUsers)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO pentest_endpoints
+			 (id, map_id, method, scheme, host, path, normalized_path, status_summary_json, content_types_json, has_auth, has_cookies, has_request_body, has_response_body, cache_hit, proxy_users_json, parameter_count, representative_flow_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`,
+			endpoint.ID, endpoint.MapID, endpoint.Method, endpoint.Scheme, endpoint.Host, endpoint.Path, endpoint.NormalizedPath, string(statusJSON), string(contentTypesJSON),
+			boolInt(endpoint.HasAuth), boolInt(endpoint.HasCookies), boolInt(endpoint.HasRequestBody), boolInt(endpoint.HasResponseBody), boolInt(endpoint.CacheHit),
+			string(proxyUsersJSON), endpoint.ParameterCount, endpoint.RepresentativeFlowID); err != nil {
+			return PentestMap{}, fmt.Errorf("insert pentest endpoint: %w", err)
+		}
+	}
+
+	for _, parameter := range parameters {
+		if strings.TrimSpace(parameter.ID) == "" {
+			parameter.ID = newStoreID()
+		}
+		parameter.MapID = m.ID
+		observedTypesJSON, _ := json.Marshal(parameter.ObservedTypes)
+		examplesJSON, _ := json.Marshal(parameter.Examples)
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO pentest_parameters
+			 (id, map_id, endpoint_id, name, location, observed_types_json, examples_json, endpoint_count, reflected, interesting, representative_flow_id)
+			 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))`,
+			parameter.ID, parameter.MapID, parameter.EndpointID, parameter.Name, parameter.Location, string(observedTypesJSON), string(examplesJSON),
+			parameter.EndpointCount, boolInt(parameter.Reflected), boolInt(parameter.Interesting), parameter.RepresentativeFlowID); err != nil {
+			return PentestMap{}, fmt.Errorf("insert pentest parameter: %w", err)
+		}
+	}
+
+	for _, observation := range observations {
+		if strings.TrimSpace(observation.ID) == "" {
+			observation.ID = newStoreID()
+		}
+		observation.MapID = m.ID
+		evidence := observation.Evidence
+		if len(evidence) == 0 {
+			evidence = json.RawMessage(`{}`)
+		}
+		if _, err := tx.ExecContext(ctx,
+			`INSERT INTO pentest_observations
+			 (id, map_id, endpoint_id, kind, severity, title, summary, evidence_json, representative_flow_id)
+			 VALUES (?, ?, NULLIF(?, ''), ?, ?, ?, ?, ?, NULLIF(?, ''))`,
+			observation.ID, observation.MapID, observation.EndpointID, observation.Kind, observation.Severity, observation.Title, observation.Summary, string(evidence), observation.RepresentativeFlowID); err != nil {
+			return PentestMap{}, fmt.Errorf("insert pentest observation: %w", err)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return PentestMap{}, err
+	}
+	return m, nil
+}
+
+func (s *Store) ListPentestMaps(ctx context.Context, scopeID string, includeOutOfScope bool) ([]PentestMap, error) {
+	if s == nil {
+		return nil, nil
+	}
+	where, args := pentestScopeWhere(scopeID, includeOutOfScope)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, COALESCE(scope_id, ''), created_at, updated_at, name, source_flow_count, endpoint_count, parameter_count, include_out_of_scope
+		 FROM pentest_maps`+where+` ORDER BY updated_at DESC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query pentest maps: %w", err)
+	}
+	defer rows.Close()
+	var maps []PentestMap
+	for rows.Next() {
+		m, err := scanPentestMap(rows)
+		if err != nil {
+			return nil, err
+		}
+		maps = append(maps, m)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return maps, nil
+}
+
+func (s *Store) GetPentestMapDetail(ctx context.Context, id string) (PentestMapDetail, bool, error) {
+	if s == nil {
+		return PentestMapDetail{}, false, nil
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, COALESCE(scope_id, ''), created_at, updated_at, name, source_flow_count, endpoint_count, parameter_count, include_out_of_scope
+		 FROM pentest_maps WHERE id = ?`, strings.TrimSpace(id))
+	m, err := scanPentestMap(row)
+	if err == sql.ErrNoRows {
+		return PentestMapDetail{}, false, nil
+	}
+	if err != nil {
+		return PentestMapDetail{}, false, err
+	}
+	endpoints, err := s.listPentestEndpoints(ctx, m.ID)
+	if err != nil {
+		return PentestMapDetail{}, false, err
+	}
+	parameters, err := s.listPentestParameters(ctx, m.ID)
+	if err != nil {
+		return PentestMapDetail{}, false, err
+	}
+	observations, err := s.listPentestObservations(ctx, m.ID)
+	if err != nil {
+		return PentestMapDetail{}, false, err
+	}
+	return PentestMapDetail{Map: m, Endpoints: endpoints, Parameters: parameters, Observations: observations}, true, nil
+}
+
+func (s *Store) GetPentestEndpoint(ctx context.Context, mapID, endpointID string) (PentestEndpoint, bool, error) {
+	if s == nil {
+		return PentestEndpoint{}, false, nil
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, map_id, method, scheme, host, path, normalized_path, status_summary_json, content_types_json, has_auth, has_cookies, has_request_body, has_response_body, cache_hit, proxy_users_json, parameter_count, COALESCE(representative_flow_id, '')
+		 FROM pentest_endpoints WHERE map_id = ? AND id = ?`, strings.TrimSpace(mapID), strings.TrimSpace(endpointID))
+	endpoint, err := scanPentestEndpoint(row)
+	if err == sql.ErrNoRows {
+		return PentestEndpoint{}, false, nil
+	}
+	if err != nil {
+		return PentestEndpoint{}, false, err
+	}
+	return endpoint, true, nil
+}
+
+func (s *Store) DeletePentestMap(ctx context.Context, id string) error {
+	if s == nil {
+		return nil
+	}
+	id = strings.TrimSpace(id)
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	for _, statement := range []string{
+		`DELETE FROM pentest_observations WHERE map_id = ?`,
+		`DELETE FROM pentest_parameters WHERE map_id = ?`,
+		`DELETE FROM pentest_endpoints WHERE map_id = ?`,
+		`DELETE FROM pentest_maps WHERE id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, statement, id); err != nil {
+			return fmt.Errorf("delete pentest map: %w", err)
+		}
+	}
+	return tx.Commit()
+}
+
+func (s *Store) listPentestEndpoints(ctx context.Context, mapID string) ([]PentestEndpoint, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, map_id, method, scheme, host, path, normalized_path, status_summary_json, content_types_json, has_auth, has_cookies, has_request_body, has_response_body, cache_hit, proxy_users_json, parameter_count, COALESCE(representative_flow_id, '')
+		 FROM pentest_endpoints WHERE map_id = ? ORDER BY host, normalized_path, method`, mapID)
+	if err != nil {
+		return nil, fmt.Errorf("query pentest endpoints: %w", err)
+	}
+	defer rows.Close()
+	var endpoints []PentestEndpoint
+	for rows.Next() {
+		endpoint, err := scanPentestEndpoint(rows)
+		if err != nil {
+			return nil, err
+		}
+		endpoints = append(endpoints, endpoint)
+	}
+	return endpoints, rows.Err()
+}
+
+func (s *Store) listPentestParameters(ctx context.Context, mapID string) ([]PentestParameter, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, map_id, endpoint_id, name, location, observed_types_json, examples_json, endpoint_count, reflected, interesting, COALESCE(representative_flow_id, '')
+		 FROM pentest_parameters WHERE map_id = ? ORDER BY interesting DESC, reflected DESC, name, location`, mapID)
+	if err != nil {
+		return nil, fmt.Errorf("query pentest parameters: %w", err)
+	}
+	defer rows.Close()
+	var parameters []PentestParameter
+	for rows.Next() {
+		parameter, err := scanPentestParameter(rows)
+		if err != nil {
+			return nil, err
+		}
+		parameters = append(parameters, parameter)
+	}
+	return parameters, rows.Err()
+}
+
+func (s *Store) listPentestObservations(ctx context.Context, mapID string) ([]PentestObservation, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, map_id, COALESCE(endpoint_id, ''), kind, severity, title, summary, evidence_json, COALESCE(representative_flow_id, '')
+		 FROM pentest_observations WHERE map_id = ? ORDER BY CASE severity WHEN 'high' THEN 0 WHEN 'medium' THEN 1 WHEN 'low' THEN 2 ELSE 3 END, kind, title`, mapID)
+	if err != nil {
+		return nil, fmt.Errorf("query pentest observations: %w", err)
+	}
+	defer rows.Close()
+	var observations []PentestObservation
+	for rows.Next() {
+		observation, err := scanPentestObservation(rows)
+		if err != nil {
+			return nil, err
+		}
+		observations = append(observations, observation)
+	}
+	return observations, rows.Err()
 }
 
 func normalizeAINote(note AINote) AINote {
@@ -1306,6 +1677,20 @@ func scopedWhere(scopeID string, includeOutOfScope bool) (string, []any) {
 	return " WHERE scope_id = ?", []any{scopeID}
 }
 
+func pentestScopeWhere(scopeID string, includeOutOfScope bool) (string, []any) {
+	scopeID = strings.TrimSpace(scopeID)
+	if scopeID == "" {
+		return "", nil
+	}
+	if scopeID == "__out_of_scope__" {
+		return " WHERE COALESCE(scope_id, '') = ''", nil
+	}
+	if includeOutOfScope {
+		return " WHERE (scope_id = ? OR COALESCE(scope_id, '') = '')", []any{scopeID}
+	}
+	return " WHERE scope_id = ?", []any{scopeID}
+}
+
 func (s *Store) GetTraffic(ctx context.Context, id string) (TrafficFlow, bool, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
@@ -1427,6 +1812,10 @@ func (s *Store) PurgeResearchData(ctx context.Context, includeCache bool) error 
 		"repeater_cases",
 		"research_scopes",
 		"ai_notes",
+		"pentest_observations",
+		"pentest_parameters",
+		"pentest_endpoints",
+		"pentest_maps",
 	}
 	if includeCache {
 		tables = append(tables, "cache_entries", "proxy_acl_rules", "proxy_users")
@@ -1646,6 +2035,7 @@ func (s *Store) DeleteResearchScope(ctx context.Context, id string) error {
 		`UPDATE repeater_cases SET scope_id = NULL WHERE scope_id = ?`,
 		`UPDATE threat_events SET scope_id = NULL WHERE scope_id = ?`,
 		`UPDATE ai_notes SET scope_id = NULL WHERE scope_id = ?`,
+		`UPDATE pentest_maps SET scope_id = NULL WHERE scope_id = ?`,
 		`DELETE FROM research_scopes WHERE id = ?`,
 	} {
 		if _, err := s.db.ExecContext(ctx, statement, id); err != nil {
@@ -2037,6 +2427,69 @@ func scanAINote(row trafficScanner) (AINote, error) {
 	return normalizeAINote(note), nil
 }
 
+func scanPentestMap(row trafficScanner) (PentestMap, error) {
+	var m PentestMap
+	var createdAt, updatedAt string
+	var includeOutOfScope int
+	if err := row.Scan(&m.ID, &m.ScopeID, &createdAt, &updatedAt, &m.Name, &m.SourceFlowCount, &m.EndpointCount, &m.ParameterCount, &includeOutOfScope); err != nil {
+		return PentestMap{}, err
+	}
+	m.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	m.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	m.IncludeOutOfScope = includeOutOfScope != 0
+	return m, nil
+}
+
+func scanPentestEndpoint(row trafficScanner) (PentestEndpoint, error) {
+	var endpoint PentestEndpoint
+	var statusJSON, contentTypesJSON, proxyUsersJSON string
+	var hasAuth, hasCookies, hasRequestBody, hasResponseBody, cacheHit int
+	if err := row.Scan(&endpoint.ID, &endpoint.MapID, &endpoint.Method, &endpoint.Scheme, &endpoint.Host, &endpoint.Path, &endpoint.NormalizedPath,
+		&statusJSON, &contentTypesJSON, &hasAuth, &hasCookies, &hasRequestBody, &hasResponseBody, &cacheHit, &proxyUsersJSON, &endpoint.ParameterCount, &endpoint.RepresentativeFlowID); err != nil {
+		return PentestEndpoint{}, err
+	}
+	_ = json.Unmarshal([]byte(statusJSON), &endpoint.StatusSummary)
+	_ = json.Unmarshal([]byte(contentTypesJSON), &endpoint.ContentTypes)
+	_ = json.Unmarshal([]byte(proxyUsersJSON), &endpoint.ProxyUsers)
+	if endpoint.StatusSummary == nil {
+		endpoint.StatusSummary = map[string]int{}
+	}
+	endpoint.HasAuth = hasAuth != 0
+	endpoint.HasCookies = hasCookies != 0
+	endpoint.HasRequestBody = hasRequestBody != 0
+	endpoint.HasResponseBody = hasResponseBody != 0
+	endpoint.CacheHit = cacheHit != 0
+	return endpoint, nil
+}
+
+func scanPentestParameter(row trafficScanner) (PentestParameter, error) {
+	var parameter PentestParameter
+	var observedTypesJSON, examplesJSON string
+	var reflected, interesting int
+	if err := row.Scan(&parameter.ID, &parameter.MapID, &parameter.EndpointID, &parameter.Name, &parameter.Location, &observedTypesJSON, &examplesJSON,
+		&parameter.EndpointCount, &reflected, &interesting, &parameter.RepresentativeFlowID); err != nil {
+		return PentestParameter{}, err
+	}
+	_ = json.Unmarshal([]byte(observedTypesJSON), &parameter.ObservedTypes)
+	_ = json.Unmarshal([]byte(examplesJSON), &parameter.Examples)
+	parameter.Reflected = reflected != 0
+	parameter.Interesting = interesting != 0
+	return parameter, nil
+}
+
+func scanPentestObservation(row trafficScanner) (PentestObservation, error) {
+	var observation PentestObservation
+	var evidence string
+	if err := row.Scan(&observation.ID, &observation.MapID, &observation.EndpointID, &observation.Kind, &observation.Severity, &observation.Title, &observation.Summary, &evidence, &observation.RepresentativeFlowID); err != nil {
+		return PentestObservation{}, err
+	}
+	if strings.TrimSpace(evidence) == "" {
+		evidence = "{}"
+	}
+	observation.Evidence = json.RawMessage(evidence)
+	return observation, nil
+}
+
 func scanProxyUser(row trafficScanner) (ProxyUser, error) {
 	var user ProxyUser
 	var enabled int
@@ -2387,6 +2840,13 @@ func boolInt(value bool) int {
 		return 1
 	}
 	return 0
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
 }
 
 func newStoreID() string {

@@ -29,6 +29,7 @@ import (
 	"mitm-proxy/internal/copilot"
 	"mitm-proxy/internal/deployments"
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/pentest"
 	"mitm-proxy/internal/policy"
 	"mitm-proxy/internal/store"
 	"mitm-proxy/internal/threats"
@@ -90,6 +91,7 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/version", s.handleVersion)
 	apiMux.HandleFunc("/api/audit", s.handleAudit)
 	apiMux.HandleFunc("/api/traffic", s.handleTraffic)
+	apiMux.HandleFunc("/api/traffic/stats", s.handleTrafficStats)
 	apiMux.HandleFunc("/api/traffic/export", s.handleTrafficExport)
 	apiMux.HandleFunc("/api/traffic/", s.handleTrafficDetail)
 	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
@@ -101,6 +103,9 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/ai/notes/", s.handleAINoteDetail)
 	apiMux.HandleFunc("/api/scopes", s.handleScopes)
 	apiMux.HandleFunc("/api/scopes/", s.handleScopeDetail)
+	apiMux.HandleFunc("/api/pentest/maps", s.handlePentestMaps)
+	apiMux.HandleFunc("/api/pentest/maps/rebuild", s.handlePentestMapRebuild)
+	apiMux.HandleFunc("/api/pentest/maps/", s.handlePentestMapDetail)
 	apiMux.HandleFunc("/metrics", s.handleMetrics)
 	apiMux.HandleFunc("/api/certificates/ca", s.handleCACertificate)
 	apiMux.HandleFunc("/api/certificates/ca/download", s.handleCACertificateDownload)
@@ -283,6 +288,19 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, s.options.EventBus.Recent("*", 200))
 }
 
+func (s *Server) handleTrafficStats(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		writeJSON(w, http.StatusOK, store.TrafficStats{})
+		return
+	}
+	stats, err := s.options.Store.TrafficStats(r.Context())
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, stats)
+}
+
 func scopeFilter(r *http.Request) (string, bool) {
 	include := strings.EqualFold(r.URL.Query().Get("include_out_of_scope"), "true")
 	return strings.TrimSpace(r.URL.Query().Get("scope_id")), include
@@ -343,6 +361,168 @@ func (s *Server) handleScopes(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 	}
+}
+
+func (s *Server) handlePentestMaps(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	scopeID, includeOutOfScope := scopeFilter(r)
+	maps, err := s.options.Store.ListPentestMaps(r.Context(), scopeID, includeOutOfScope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, maps)
+}
+
+func (s *Server) handlePentestMapRebuild(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var input struct {
+		ScopeID           string `json:"scope_id"`
+		IncludeOutOfScope bool   `json:"include_out_of_scope"`
+		Name              string `json:"name"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil && err != io.EOF {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	filterScopeID := strings.TrimSpace(input.ScopeID)
+	mapScopeID := filterScopeID
+	if filterScopeID == "__out_of_scope__" {
+		mapScopeID = ""
+	}
+	flows, err := s.loadPentestTrafficDetails(r.Context(), filterScopeID, input.IncludeOutOfScope)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	result := pentest.Analyze(flows, pentest.Options{ScopeID: mapScopeID, IncludeOutOfScope: input.IncludeOutOfScope, Name: input.Name})
+	created, err := s.options.Store.SavePentestMap(r.Context(), result.Map, result.Endpoints, result.Parameters, result.Observations)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	detail, _, err := s.options.Store.GetPentestMapDetail(r.Context(), created.ID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "pentest.map.rebuild", map[string]any{"id": created.ID, "scope_id": created.ScopeID, "source_flow_count": created.SourceFlowCount})
+	writeJSON(w, http.StatusCreated, detail)
+}
+
+func (s *Server) handlePentestMapDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/pentest/maps/"), "/")
+	parts := strings.Split(path, "/")
+	if len(parts) == 4 && parts[1] == "endpoints" && parts[3] == "clone" {
+		s.handlePentestEndpointClone(w, r, parts[0], parts[2])
+		return
+	}
+	if len(parts) != 1 || parts[0] == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pentest map not found"})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		detail, ok, err := s.options.Store.GetPentestMapDetail(r.Context(), parts[0])
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "pentest map not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+	case http.MethodDelete:
+		if err := s.options.Store.DeletePentestMap(r.Context(), parts[0]); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "pentest.map.delete", map[string]any{"id": parts[0]})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handlePentestEndpointClone(w http.ResponseWriter, r *http.Request, mapID, endpointID string) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	endpoint, ok, err := s.options.Store.GetPentestEndpoint(r.Context(), mapID, endpointID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok || strings.TrimSpace(endpoint.RepresentativeFlowID) == "" {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "pentest endpoint not found"})
+		return
+	}
+	flow, ok, err := s.options.Store.GetTrafficDetail(r.Context(), endpoint.RepresentativeFlowID)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	if !ok {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "representative flow not found"})
+		return
+	}
+	c, err := repeaterCaseFromTraffic(flow)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	c.Name = "Pentest " + endpoint.Method + " " + endpoint.NormalizedPath
+	created, err := s.options.Store.CreateRepeaterCase(r.Context(), c)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	s.audit(r, "pentest.endpoint.clone", map[string]any{"map_id": mapID, "endpoint_id": endpointID, "flow_id": flow.ID, "case_id": created.ID})
+	writeJSON(w, http.StatusCreated, created)
+}
+
+func (s *Server) loadPentestTrafficDetails(ctx context.Context, scopeID string, includeOutOfScope bool) ([]store.TrafficDetail, error) {
+	const pageSize = 500
+	var details []store.TrafficDetail
+	for offset := 0; ; offset += pageSize {
+		flows, err := s.options.Store.ListTrafficScopedPage(ctx, pageSize, offset, scopeID, includeOutOfScope, "")
+		if err != nil {
+			return nil, err
+		}
+		for _, flow := range flows {
+			detail, ok, err := s.options.Store.GetTrafficDetail(ctx, flow.ID)
+			if err != nil {
+				return nil, err
+			}
+			if ok {
+				details = append(details, detail)
+			}
+		}
+		if len(flows) < pageSize {
+			break
+		}
+	}
+	return details, nil
 }
 
 func (s *Server) handleScopeDetail(w http.ResponseWriter, r *http.Request) {

@@ -210,10 +210,11 @@ Initial dashboard/API coverage includes:
 
 - GET /api/health and GET /api/version
 - GET /api/audit
-- GET /api/traffic, GET /api/traffic/{id}, GET /api/traffic/stream, DELETE /api/traffic, and POST /api/traffic/{id}/replay
+- GET /api/traffic, GET /api/traffic/stats, GET /api/traffic/{id}, GET /api/traffic/stream, DELETE /api/traffic, and POST /api/traffic/{id}/replay
 - GET /api/traffic/export?format=har for HAR-style export
 - GET/POST/PUT/DELETE /api/repeater/cases and POST /api/repeater/cases/{id}/send for saved editable replay cases
 - GET/POST/PUT/DELETE /api/scopes plus scope assignment endpoints for traffic and repeater cases
+- GET/POST/DELETE /api/pentest/maps plus endpoint clone actions for passive target maps
 - GET/POST/PUT/DELETE /api/proxy-auth/users and /api/proxy-acl/rules plus POST /api/proxy-acl/test for proxy client access control
 - POST /api/ai/traffic/{id}/explain, POST /api/ai/traffic/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/compare-runs, and GET/POST/DELETE /api/ai/notes for AI research copilot notes
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
@@ -268,6 +269,12 @@ The dashboard's **Repeater** view lets security researchers clone captured HTTP 
 Captured request bodies are only prefilled when `traffic_capture.store_bodies` was enabled at capture time. If body redaction was enabled, the repeater receives the redacted sample; uncaptured bodies remain empty and can be edited manually.
 
 The legacy `POST /api/traffic/{id}/replay` endpoint remains available for one-shot replay, while the repeater is intended for repeatable request mutation and response comparison.
+
+### Pentest Toolkit
+
+The dashboard's **Pentest Toolkit** view builds passive target maps from captured traffic. Rebuilding a map analyzes only stored traffic for the selected scope, groups endpoints by normalized path, extracts query/body/cookie/header parameters, records reflected and interesting parameters, and adds passive hints such as missing security headers, cookie attribute gaps, permissive CORS, and verbose errors.
+
+Pentest maps are persisted in SQLite and can be deleted independently. The toolkit never sends requests, crawls, fuzzes, or mutates targets; endpoint evidence can be cloned into Repeater for manual testing.
 
 ### Research Scopes
 
