@@ -22,6 +22,7 @@ import (
 	"strings"
 	"time"
 
+	"mitm-proxy/internal/access"
 	"mitm-proxy/internal/admin/auth"
 	"mitm-proxy/internal/admin/ui"
 	cfgpkg "mitm-proxy/internal/config"
@@ -123,6 +124,11 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/cache/purge", s.handleCachePurge)
 	apiMux.HandleFunc("/api/settings/danger", s.handleSettingsDanger)
 	apiMux.HandleFunc("/api/settings", s.handleSettings)
+	apiMux.HandleFunc("/api/proxy-auth/users", s.handleProxyAuthUsers)
+	apiMux.HandleFunc("/api/proxy-auth/users/", s.handleProxyAuthUserDetail)
+	apiMux.HandleFunc("/api/proxy-acl/rules", s.handleProxyACLRules)
+	apiMux.HandleFunc("/api/proxy-acl/rules/", s.handleProxyACLRuleDetail)
+	apiMux.HandleFunc("/api/proxy-acl/test", s.handleProxyACLTest)
 	apiMux.HandleFunc("/api/admin/users", s.handleAdminUsers)
 	apiMux.HandleFunc("/api/admin/users/", s.handleAdminUserDetail)
 	apiMux.HandleFunc("/api/threats/events", s.handleThreatEvents)
@@ -1805,9 +1811,13 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			MinTLSVersion   string   `json:"min_tls_version"`
 			IdleTimeout     *int     `json:"idle_timeout_seconds"`
 			TrafficCapture  *struct {
-				StoreBodies  *bool  `json:"store_bodies"`
-				MaxBodyBytes *int64 `json:"max_body_bytes"`
-				RedactBodies *bool  `json:"redact_bodies"`
+				StoreBodies     *bool    `json:"store_bodies"`
+				MaxBodyBytes    *int64   `json:"max_body_bytes"`
+				RedactBodies    *bool    `json:"redact_bodies"`
+				StoreHeaders    *bool    `json:"store_headers"`
+				RedactedHeaders []string `json:"redacted_headers"`
+				StoreCookies    *bool    `json:"store_cookies"`
+				RedactedCookies []string `json:"redacted_cookies"`
 			} `json:"traffic_capture"`
 			AICopilot *struct {
 				Enabled         *bool  `json:"enabled"`
@@ -1828,6 +1838,12 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				ChainTunnels    *bool    `json:"chain_tunnels"`
 				ApplyToRepeater *bool    `json:"apply_to_repeater"`
 			} `json:"upstream_proxy"`
+			ProxyAuth *struct {
+				Enabled                *bool  `json:"enabled"`
+				Realm                  string `json:"realm"`
+				RequireAuthForLoopback *bool  `json:"require_auth_for_loopback"`
+				DefaultAction          string `json:"default_action"`
+			} `json:"proxy_auth"`
 			Cache *struct {
 				Enabled           *bool    `json:"enabled"`
 				Directory         string   `json:"directory"`
@@ -1869,6 +1885,18 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 			if input.TrafficCapture.RedactBodies != nil {
 				cfg.TrafficCapture.RedactBodies = *input.TrafficCapture.RedactBodies
+			}
+			if input.TrafficCapture.StoreHeaders != nil {
+				cfg.TrafficCapture.StoreHeaders = *input.TrafficCapture.StoreHeaders
+			}
+			if input.TrafficCapture.RedactedHeaders != nil {
+				cfg.TrafficCapture.RedactedHeaders = input.TrafficCapture.RedactedHeaders
+			}
+			if input.TrafficCapture.StoreCookies != nil {
+				cfg.TrafficCapture.StoreCookies = *input.TrafficCapture.StoreCookies
+			}
+			if input.TrafficCapture.RedactedCookies != nil {
+				cfg.TrafficCapture.RedactedCookies = input.TrafficCapture.RedactedCookies
 			}
 		}
 		if input.AICopilot != nil {
@@ -1915,6 +1943,20 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				cfg.UpstreamProxy.ApplyToRepeater = *input.UpstreamProxy.ApplyToRepeater
 			}
 		}
+		if input.ProxyAuth != nil {
+			if input.ProxyAuth.Enabled != nil {
+				cfg.ProxyAuth.Enabled = *input.ProxyAuth.Enabled
+			}
+			if input.ProxyAuth.Realm != "" {
+				cfg.ProxyAuth.Realm = input.ProxyAuth.Realm
+			}
+			if input.ProxyAuth.RequireAuthForLoopback != nil {
+				cfg.ProxyAuth.RequireAuthForLoopback = *input.ProxyAuth.RequireAuthForLoopback
+			}
+			if input.ProxyAuth.DefaultAction != "" {
+				cfg.ProxyAuth.DefaultAction = input.ProxyAuth.DefaultAction
+			}
+		}
 		if input.Cache != nil {
 			if input.Cache.Enabled != nil {
 				cfg.Cache.Enabled = *input.Cache.Enabled
@@ -1939,6 +1981,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 		if err := cfg.ValidateUpstreamProxy(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := cfg.ValidateProxyAuth(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2020,6 +2066,243 @@ func (s *Server) handleSettingsDanger(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.Error(w, "unknown dangerous action", http.StatusBadRequest)
 	}
+}
+
+func (s *Server) handleProxyAuthUsers(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		users, err := s.options.Store.ListProxyUsers(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, users)
+	case http.MethodPost:
+		var input struct {
+			Username string `json:"username"`
+			Password string `json:"password"`
+			Enabled  *bool  `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		hash, err := access.HashPassword(input.Password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		enabled := true
+		if input.Enabled != nil {
+			enabled = *input.Enabled
+		}
+		user, err := s.options.Store.CreateProxyUser(r.Context(), store.ProxyUser{Username: input.Username, PasswordHash: hash, Enabled: enabled})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_auth.users.create", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusCreated, user)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyAuthUserDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy-auth/users/"), "/")
+	if strings.HasSuffix(path, "/reset-password") {
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		id := strings.TrimSuffix(path, "/reset-password")
+		id = strings.Trim(id, "/")
+		var input struct {
+			Password string `json:"password"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		hash, err := access.HashPassword(input.Password)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		user, err := s.options.Store.ResetProxyUserPassword(r.Context(), id, hash)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusNotFound)
+			return
+		}
+		s.audit(r, "proxy_auth.users.reset_password", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusOK, user)
+		return
+	}
+	id := path
+	switch r.Method {
+	case http.MethodPut:
+		var input struct {
+			Username string `json:"username"`
+			Enabled  *bool  `json:"enabled"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		current, ok, err := s.options.Store.GetProxyUser(r.Context(), id)
+		if err != nil || !ok {
+			http.Error(w, "proxy user not found", http.StatusNotFound)
+			return
+		}
+		if input.Username != "" {
+			current.Username = input.Username
+		}
+		if input.Enabled != nil {
+			current.Enabled = *input.Enabled
+		}
+		user, err := s.options.Store.UpdateProxyUser(r.Context(), current)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_auth.users.update", map[string]any{"id": user.ID, "username": user.Username})
+		writeJSON(w, http.StatusOK, user)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteProxyUser(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "proxy_auth.users.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyACLRules(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.options.Store.ListProxyACLRules(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rules)
+	case http.MethodPost:
+		rule, ok := s.decodeProxyACLRule(w, r)
+		if !ok {
+			return
+		}
+		created, err := s.options.Store.CreateProxyACLRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.create", map[string]any{"id": created.ID, "action": created.Action})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleProxyACLRuleDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/proxy-acl/rules/"), "/")
+	switch r.Method {
+	case http.MethodPut:
+		rule, ok := s.decodeProxyACLRule(w, r)
+		if !ok {
+			return
+		}
+		rule.ID = id
+		updated, err := s.options.Store.UpdateProxyACLRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.update", map[string]any{"id": updated.ID, "action": updated.Action})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteProxyACLRule(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "proxy_acl.rules.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) decodeProxyACLRule(w http.ResponseWriter, r *http.Request) (store.ProxyACLRule, bool) {
+	var rule store.ProxyACLRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return store.ProxyACLRule{}, false
+	}
+	if rule.Action == "" {
+		rule.Action = "deny"
+	}
+	if rule.Action != "allow" && rule.Action != "deny" {
+		http.Error(w, "action must be allow or deny", http.StatusBadRequest)
+		return store.ProxyACLRule{}, false
+	}
+	return rule, true
+}
+
+func (s *Server) handleProxyACLTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Username string `json:"username"`
+		RemoteIP string `json:"remote_ip"`
+		Method   string `json:"method"`
+		URL      string `json:"url"`
+		Host     string `json:"host"`
+		Port     int    `json:"port"`
+		ScopeID  string `json:"scope_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	target := input.URL
+	if target == "" {
+		host := input.Host
+		if input.Port > 0 && !strings.Contains(host, ":") {
+			host = net.JoinHostPort(host, strconv.Itoa(input.Port))
+		}
+		target = host
+	}
+	controller := access.NewController(s.options.Config, s.options.Store)
+	decision := controller.Test(r.Context(), input.Username, net.JoinHostPort(stringDefault(input.RemoteIP, "127.0.0.1"), "12345"), stringDefault(input.Method, http.MethodGet), target, input.ScopeID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"allowed": decision.Allowed,
+		"rule_id": decision.RuleID,
+		"reason":  decision.Reason,
+		"info":    decision.Info,
+	})
 }
 
 func (s *Server) handleAdminUsers(w http.ResponseWriter, r *http.Request) {
@@ -2106,6 +2389,7 @@ func safeSettings(cfg *cfgpkg.Config) map[string]any {
 		"traffic_capture":      cfg.TrafficCapture,
 		"ai_copilot":           cfg.AICopilot,
 		"upstream_proxy":       safeUpstreamProxySettings(cfg.UpstreamProxy),
+		"proxy_auth":           cfg.ProxyAuth,
 	}
 }
 
@@ -2418,6 +2702,13 @@ func removeString(values []string, value string) []string {
 		}
 	}
 	return out
+}
+
+func stringDefault(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
 }
 
 func removeInt(values []int, value int) []int {

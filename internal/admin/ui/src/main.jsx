@@ -38,6 +38,7 @@ const VIEWS = [
     ["Scopes", Crosshair],
   ] },
   { group: "Operate", items: [
+    ["Access Control", Users],
     ["Blocks", Ban],
     ["Deployments", Server],
     ["Cache", Database],
@@ -55,6 +56,7 @@ const VIEW_SLUGS = {
   "Threat Scanner": "threat-scanner",
   Certificates: "certificates",
   Scopes: "scopes",
+  "Access Control": "access-control",
   Blocks: "blocks",
   Deployments: "deployments",
   Cache: "cache",
@@ -238,6 +240,7 @@ function App() {
       case "Threat Scanner": return <ThreatScannerView {...props} />;
       case "Certificates": return <CertificatesView {...props} />;
       case "Scopes": return <ScopesView {...props} setSelectedScope={setSelectedScope} />;
+      case "Access Control": return <AccessControlView {...props} />;
       case "Blocks": return <BlocksView {...props} />;
       case "Deployments": return <DeploymentsView {...props} />;
       case "Cache": return <CacheView {...props} />;
@@ -515,6 +518,7 @@ function FlowRow({ flow, scopes, active, onSelect }) {
         <MethodPill method={method} />
         <span>{flow.host || "(unknown host)"}</span>
         <ScopeBadge scopeID={flow.scope_id} scopes={scopes} />
+        <ProxyUserBadge username={flow.proxy_user} />
       </div>
       <div className="list-row-meta">{flow.status ? `status ${flow.status}` : "pending"} · {flow.duration_ms !== undefined ? `${flow.duration_ms} ms` : "duration unknown"} · {flow.created_at || ""}</div>
       <div className="list-row-meta">{flow.url || flow.id}</div>
@@ -541,6 +545,7 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
         <div className="detail-title">
             <h2>Request Detail</h2>
             <ScopeBadge scopeID={flow.scope_id} scopes={scopes} />
+            <ProxyUserBadge username={flow.proxy_user} />
             <div className="url-line">{flow.url || ""}</div>
         </div>
         <div className="detail-actions">
@@ -998,6 +1003,87 @@ function CertificatesView({ refreshKey, refresh }) {
   );
 }
 
+function AccessControlView({ refreshKey, refresh }) {
+  const state = useAsync(async () => {
+    const [users, rules] = await Promise.all([api("/api/proxy-auth/users"), api("/api/proxy-acl/rules")]);
+    return { users, rules };
+  }, [refreshKey]);
+  const [userForm, setUserForm] = useState({ username: "", password: "", enabled: true });
+  const emptyRule = { priority: 100, enabled: true, action: "deny", name: "", description: "", users: [], source_ips: [], host_patterns: [], port_patterns: [], method_patterns: [], scope_ids: [] };
+  const [ruleForm, setRuleForm] = useState(emptyRule);
+  const [selectedRuleID, setSelectedRuleID] = useState("");
+  const [passwords, setPasswords] = useState({});
+  const [testForm, setTestForm] = useState({ username: "", remote_ip: "127.0.0.1", method: "GET", url: "https://example.com/", scope_id: "" });
+  const [testResult, setTestResult] = useState(null);
+  useEffect(() => {
+    const rule = (state.data?.rules || []).find((item) => item.id === selectedRuleID);
+    if (rule) setRuleForm(rule);
+  }, [selectedRuleID, state.data]);
+  if (state.loading || state.error) return <PageState state={state} />;
+  const { users, rules } = state.data;
+  const saveRule = async () => {
+    if (selectedRuleID) await putJSON(`/api/proxy-acl/rules/${encodeURIComponent(selectedRuleID)}`, ruleForm);
+    else {
+      const created = await postJSON("/api/proxy-acl/rules", ruleForm);
+      setSelectedRuleID(created.id);
+    }
+    refresh();
+  };
+  return <div className="page-stack">
+    <PageTitle title="Access Control" subtitle="Proxy users, authentication, and ordered allow/deny rules." />
+    <div className="split-grid">
+      <div className="panel">
+        <h2>Proxy Users</h2>
+        <div className="settings-grid">
+          <label>Username<input value={userForm.username} onChange={(e) => setUserForm({ ...userForm, username: e.target.value })} /></label>
+          <label>Password<input type="password" value={userForm.password} onChange={(e) => setUserForm({ ...userForm, password: e.target.value })} /></label>
+          <label><input type="checkbox" checked={userForm.enabled} onChange={(e) => setUserForm({ ...userForm, enabled: e.target.checked })} /> Enabled</label>
+        </div>
+        <button className="secondary" onClick={async () => { await postJSON("/api/proxy-auth/users", userForm); setUserForm({ username: "", password: "", enabled: true }); refresh(); }}><Plus />Add User</button>
+        <table><thead><tr><th>User</th><th>Enabled</th><th>Last used</th><th>Reset</th><th /></tr></thead><tbody>{users.map((user) => <tr key={user.id}><td>{user.username}</td><td><input type="checkbox" checked={!!user.enabled} onChange={async (e) => { await putJSON(`/api/proxy-auth/users/${user.id}`, { username: user.username, enabled: e.target.checked }); refresh(); }} /></td><td>{user.last_used_at || ""}</td><td><input type="password" className="compact-input" value={passwords[user.id] || ""} onChange={(e) => setPasswords({ ...passwords, [user.id]: e.target.value })} placeholder="new password" /></td><td><button className="rowbutton" onClick={async () => { await postJSON(`/api/proxy-auth/users/${user.id}/reset-password`, { password: passwords[user.id] || "" }); setPasswords({ ...passwords, [user.id]: "" }); refresh(); }}>Reset</button> <button className="rowbutton" onClick={async () => { await del(`/api/proxy-auth/users/${user.id}`); refresh(); }}>Delete</button></td></tr>)}</tbody></table>
+      </div>
+      <div className="panel">
+        <h2>ACL Test</h2>
+        <div className="settings-grid">
+          <label>User<input value={testForm.username} onChange={(e) => setTestForm({ ...testForm, username: e.target.value })} /></label>
+          <label>Source IP<input value={testForm.remote_ip} onChange={(e) => setTestForm({ ...testForm, remote_ip: e.target.value })} /></label>
+          <label>Method<input value={testForm.method} onChange={(e) => setTestForm({ ...testForm, method: e.target.value })} /></label>
+          <label>URL<input value={testForm.url} onChange={(e) => setTestForm({ ...testForm, url: e.target.value })} /></label>
+          <label>Scope ID<input value={testForm.scope_id} onChange={(e) => setTestForm({ ...testForm, scope_id: e.target.value })} /></label>
+        </div>
+        <button className="secondary" onClick={async () => setTestResult(await postJSON("/api/proxy-acl/test", testForm))}>Test Rule</button>
+        {testResult && <CodeCard title="ACL Test Result" value={testResult} />}
+      </div>
+    </div>
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head"><div><h2>ACL Rules</h2><p>First enabled match by priority wins.</p></div><button className="secondary" onClick={() => { setSelectedRuleID(""); setRuleForm(emptyRule); }}><Plus />New</button></div>
+        <div className="workbench-list">{rules.length ? rules.map((rule) => <button key={rule.id} className={`list-row ${rule.id === selectedRuleID ? "active" : ""}`} onClick={() => setSelectedRuleID(rule.id)}><div className="list-row-title"><span className={`badge ${rule.action === "allow" ? "allow" : "block"}`}>{rule.action}</span><span>{rule.name}</span></div><div className="list-row-meta">priority {rule.priority} - {rule.enabled ? "enabled" : "disabled"}</div></button>) : <EmptyList>No ACL rules yet.</EmptyList>}</div>
+      </aside>
+      <section className="workbench-main">
+        <div className="detail-shell">
+          <div className="detail-topbar"><div className="detail-title"><h2>{selectedRuleID ? "Edit ACL Rule" : "New ACL Rule"}</h2></div><div className="detail-actions"><button className="primary" onClick={saveRule}><Save />Save</button>{selectedRuleID && <button className="secondary danger-button" onClick={async () => { await del(`/api/proxy-acl/rules/${selectedRuleID}`); setSelectedRuleID(""); setRuleForm(emptyRule); refresh(); }}><Trash2 />Delete</button>}</div></div>
+          <div className="settings-grid">
+            <label>Name<input value={ruleForm.name || ""} onChange={(e) => setRuleForm({ ...ruleForm, name: e.target.value })} /></label>
+            <label>Priority<input type="number" value={ruleForm.priority || 100} onChange={(e) => setRuleForm({ ...ruleForm, priority: Number(e.target.value) })} /></label>
+            <label>Action<select value={ruleForm.action || "deny"} onChange={(e) => setRuleForm({ ...ruleForm, action: e.target.value })}><option value="allow">allow</option><option value="deny">deny</option></select></label>
+            <label><input type="checkbox" checked={ruleForm.enabled !== false} onChange={(e) => setRuleForm({ ...ruleForm, enabled: e.target.checked })} /> Enabled</label>
+          </div>
+          <label className="stacked-label">Description<textarea value={ruleForm.description || ""} onChange={(e) => setRuleForm({ ...ruleForm, description: e.target.value })} /></label>
+          <div className="split-grid">
+            <PatternEditor title="Users" placeholder={"alice\nbob"} values={ruleForm.users || []} onChange={(values) => setRuleForm({ ...ruleForm, users: values })} />
+            <PatternEditor title="Source IPs" placeholder={"127.0.0.1\n10.0.0.0/8"} values={ruleForm.source_ips || []} onChange={(values) => setRuleForm({ ...ruleForm, source_ips: values })} />
+            <PatternEditor title="Hosts" placeholder={"example.com\n*.example.com"} values={ruleForm.host_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, host_patterns: values })} />
+            <PatternEditor title="Ports" placeholder={"443\n8000-8999"} values={ruleForm.port_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, port_patterns: values })} />
+            <PatternEditor title="Methods" placeholder={"GET\nPOST"} values={ruleForm.method_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, method_patterns: values })} />
+            <PatternEditor title="Scope IDs" placeholder={"scope-id\n__out_of_scope__"} values={ruleForm.scope_ids || []} onChange={(values) => setRuleForm({ ...ruleForm, scope_ids: values })} />
+          </div>
+        </div>
+      </section>
+    </div>
+  </div>;
+}
+
 function BlocksView({ refreshKey, refresh }) {
   const state = useAsync(async () => {
     const [ports, domains, ips] = await Promise.all([api("/api/blocks/ports"), api("/api/blocks/domains"), api("/api/blocks/ips")]);
@@ -1232,10 +1318,12 @@ function SettingsView({ refreshKey, refresh }) {
   const capture = form.traffic_capture || {};
   const aiCopilot = form.ai_copilot || {};
   const upstreamProxy = form.upstream_proxy || {};
+  const proxyAuth = form.proxy_auth || {};
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
   const setCapture = (patch) => set({ traffic_capture: { ...capture, ...patch } });
   const setAICopilot = (patch) => set({ ai_copilot: { ...aiCopilot, ...patch } });
   const setUpstreamProxy = (patch) => set({ upstream_proxy: { ...upstreamProxy, ...patch } });
+  const setProxyAuth = (patch) => set({ proxy_auth: { ...proxyAuth, ...patch } });
   const danger = async (action, message) => {
     if (!confirm(message)) return;
     await postJSON("/api/settings/danger", { action, confirm: true });
@@ -1262,7 +1350,13 @@ function SettingsView({ refreshKey, refresh }) {
         <div className="settings-grid">
           <label><input type="checkbox" checked={!!capture.store_bodies} onChange={(e) => setCapture({ store_bodies: e.target.checked })} /> Store body samples</label>
           <label><input type="checkbox" checked={capture.redact_bodies !== false} onChange={(e) => setCapture({ redact_bodies: e.target.checked })} /> Redact body samples</label>
+          <label><input type="checkbox" checked={capture.store_headers !== false} onChange={(e) => setCapture({ store_headers: e.target.checked })} /> Store headers</label>
+          <label><input type="checkbox" checked={capture.store_cookies !== false} onChange={(e) => setCapture({ store_cookies: e.target.checked })} /> Store cookies</label>
           <label>Max body bytes<input type="number" value={capture.max_body_bytes || 32768} onChange={(e) => setCapture({ max_body_bytes: Number(e.target.value) })} /></label>
+        </div>
+        <div className="split-grid">
+          <PatternEditor title="Redacted Headers" placeholder={"Authorization\nCookie\nSet-Cookie\nX-Api-Key"} values={capture.redacted_headers || []} onChange={(values) => setCapture({ redacted_headers: values })} />
+          <PatternEditor title="Redacted Cookies" placeholder={"session\ncsrf_token"} values={capture.redacted_cookies || []} onChange={(values) => setCapture({ redacted_cookies: values })} />
         </div>
         <h3>AI Copilot</h3>
         <div className="settings-grid">
@@ -1286,6 +1380,14 @@ function SettingsView({ refreshKey, refresh }) {
         </div>
         <label className="stacked-label">Bypass hosts<textarea placeholder={"localhost\n127.0.0.1\n*.internal"} value={(upstreamProxy.no_proxy || []).join("\n")} onChange={(e) => setUpstreamProxy({ no_proxy: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} /></label>
         <p className="muted">HTTP and HTTPS upstream proxies are supported. Passwords are read from the proxy process environment and are never stored in dashboard settings.</p>
+        <h3>Proxy Authentication</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!proxyAuth.enabled} onChange={(e) => setProxyAuth({ enabled: e.target.checked, default_action: e.target.checked ? "deny" : (proxyAuth.default_action || "allow") })} /> Require proxy authentication</label>
+          <label>Realm<input value={proxyAuth.realm || "MITM Proxy"} onChange={(e) => setProxyAuth({ realm: e.target.value })} /></label>
+          <label>Default action<select value={proxyAuth.default_action || "allow"} onChange={(e) => setProxyAuth({ default_action: e.target.value })}><option value="allow">allow</option><option value="deny">deny</option></select></label>
+          <label><input type="checkbox" checked={!!proxyAuth.require_auth_for_loopback} onChange={(e) => setProxyAuth({ require_auth_for_loopback: e.target.checked })} /> Require auth for loopback clients</label>
+        </div>
+        <p className="muted">Manage proxy users and ordered ACL rules in Access Control. Passwords are hashed before storage.</p>
         <h3>Excluded Domains</h3>
         <textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} />
         <CodeCard title="Cache" value={form.cache || {}} />
@@ -1293,7 +1395,7 @@ function SettingsView({ refreshKey, refresh }) {
       <div className="panel danger-zone">
         <div className="detail-topbar"><div><h2>Dangerous</h2><p className="muted">Destructive maintenance actions. Each action requires confirmation.</p></div></div>
         <div className="actions">
-          <button className="secondary danger-button" onClick={() => danger("all", "Purge all stored dashboard research data, including cache? This cannot be undone.")}><Trash2 />Purge All Data</button>
+          <button className="secondary danger-button" onClick={() => danger("all", "Purge all stored dashboard research data, cache, proxy users, and ACL rules? This cannot be undone.")}><Trash2 />Purge All Data</button>
           <button className="secondary danger-button" onClick={() => danger("except_cache", "Purge all stored dashboard research data except cache? This cannot be undone.")}><Trash2 />Purge All Except Cache</button>
           <button className="secondary danger-button" onClick={() => danger("cache", "Purge all cached responses? This cannot be undone.")}><Trash2 />Purge Cache</button>
         </div>
@@ -1347,6 +1449,11 @@ function ScopeBadge({ scopeID, scopes }) {
   if (!scopeID) return <span className="scope-badge out">out of scope</span>;
   const scope = (scopes || []).find((item) => item.id === scopeID);
   return <span className="scope-badge">{scope ? scope.name : "scope"}</span>;
+}
+
+function ProxyUserBadge({ username }) {
+  if (!username) return null;
+  return <span className="scope-badge user">{username}</span>;
 }
 
 function EmptyList({ children }) {

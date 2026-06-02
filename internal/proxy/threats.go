@@ -10,6 +10,8 @@ import (
 	"strconv"
 	"strings"
 
+	"mitm-proxy/internal/access"
+	"mitm-proxy/internal/config"
 	"mitm-proxy/internal/policy"
 	"mitm-proxy/internal/threats"
 )
@@ -242,6 +244,30 @@ func threatBlockedResponse(verdict threats.ThreatVerdict) *http.Response {
 	}
 }
 
+func accessBlockedResponse(cfg *config.Config, decision access.Decision) *http.Response {
+	status, body := access.DeniedPageHTML(cfg, decision)
+	return &http.Response{
+		StatusCode: status,
+		Proto:      "HTTP/1.1",
+		ProtoMajor: 1,
+		ProtoMinor: 1,
+		Header: http.Header{
+			"Content-Type":   []string{"text/html; charset=utf-8"},
+			"Cache-Control":  []string{"no-store"},
+			"Content-Length": []string{strconv.Itoa(len(body))},
+		},
+		Body: io.NopCloser(strings.NewReader(body)),
+	}
+}
+
+func writeAccessBlockedResponse(w http.ResponseWriter, cfg *config.Config, decision access.Decision) {
+	status, body := access.DeniedPageHTML(cfg, decision)
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(status)
+	_, _ = w.Write([]byte(body))
+}
+
 func renderThreatBlockPage(status int, verdict threats.ThreatVerdict) string {
 	category := htmlEscape(displayValue(verdict.Category, "suspicious content"))
 	reason := htmlEscape(displayValue(verdict.Reason, "The proxy blocked this request before it reached your browser."))
@@ -413,6 +439,13 @@ func displayValue(value, fallback string) string {
 	return value
 }
 
+func defaultString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
 func (p *Proxy) checkPolicy(hostPort string) policy.BlockDecision {
 	cfg := p.cfg()
 	engine := policy.New(cfg.BlockedPorts, cfg.BlockedDomains, cfg.BlockedIPs)
@@ -443,6 +476,14 @@ func (p *Proxy) checkPolicy(hostPort string) policy.BlockDecision {
 		}
 	}
 	return policy.BlockDecision{}
+}
+
+func policyDecision(decision access.Decision) policy.BlockDecision {
+	return policy.BlockDecision{
+		Blocked: true,
+		Reason:  decision.Reason,
+		RuleID:  defaultString(decision.RuleID, "proxy_auth"),
+	}
 }
 
 func threatsFromPolicy(decision policy.BlockDecision) threats.ThreatVerdict {

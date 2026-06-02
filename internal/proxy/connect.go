@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"strings"
 
+	"mitm-proxy/internal/access"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/upstream"
 )
@@ -58,12 +59,23 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	accessDecision := p.accessController().AuthorizeRequest(r, hostPort)
+	if !accessDecision.Allowed {
+		p.publishAccessDenied(r, accessDecision)
+		access.WriteDenied(w, p.cfg(), accessDecision)
+		return
+	}
+	proxyUser := accessDecision.Username
+
 	if decision := p.checkPolicy(hostPort); decision.Blocked {
 		p.publish(events.TopicTrafficBlocked, map[string]any{
-			"method":  r.Method,
-			"target":  hostPort,
-			"rule_id": decision.RuleID,
-			"reason":  decision.Reason,
+			"method":     r.Method,
+			"target":     hostPort,
+			"host":       host,
+			"rule_id":    decision.RuleID,
+			"reason":     decision.Reason,
+			"remote_ip":  remoteIP(r.RemoteAddr),
+			"proxy_user": proxyUser,
 		}, "")
 		http.Error(w, decision.Reason, p.cfg().BlockResponseStatus)
 		return
@@ -97,7 +109,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if p.cfg().IsDomainExcluded(host) {
 		p.logVerbose("Domain %s is excluded, using plain tunnel", host)
-		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
 
 		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
@@ -105,7 +117,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if port != "443" {
-		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
 		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
 		return
@@ -113,7 +125,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	if !p.cfg().EnableMITM {
 		p.logVerbose("MITM disabled, using plain tunnel for %s", hostPort)
-		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr)
+		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
 
 		go tunnelTCP(r.Context(), clientConn, hostPort, p)
 
@@ -150,8 +162,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	switch state.NegotiatedProtocol {
 	case "h2":
-		p.mitmHTTPS2(tlsConn, host)
+		p.mitmHTTPS2(tlsConn, host, proxyUser, r.RemoteAddr)
 	default:
-		p.mitmHTTPS11(tlsConn, host)
+		p.mitmHTTPS11(tlsConn, host, proxyUser, r.RemoteAddr)
 	}
 }

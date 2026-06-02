@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"mitm-proxy/internal/access"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/upstream"
 )
@@ -58,6 +59,27 @@ func stripHopByHopHeaders(h http.Header) {
 
 // handleHTTP proxies plain HTTP and upgrades ws://
 func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
+	target := r.URL.String()
+	if target == "" || r.URL.Host == "" {
+		clone := *r.URL
+		if clone.Scheme == "" {
+			clone.Scheme = "http"
+		}
+		if clone.Host == "" {
+			clone.Host = r.Host
+		}
+		target = clone.String()
+	}
+	decision := p.accessController().AuthorizeRequest(r, target)
+	if !decision.Allowed {
+		p.publishAccessDenied(r, decision)
+		access.WriteDenied(w, p.cfg(), decision)
+		return
+	}
+	if decision.Username != "" {
+		r = r.WithContext(access.WithUsername(r.Context(), decision.Username))
+	}
+
 	if isWebSocketRequest(r) {
 		p.handleWebSocketHTTP(w, r)
 
@@ -78,9 +100,9 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if req.URL.Host == "" {
 		req.URL.Host = r.Host
 	}
-	p.publishTrafficStarted(requestID, req, "http/1.1")
 
 	stripHopByHopHeaders(req.Header)
+	p.publishTrafficStarted(requestID, req, "http/1.1")
 
 	if decision := p.checkPolicy(req.URL.Host); decision.Blocked {
 		p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
@@ -221,6 +243,7 @@ func (p *Proxy) handleWebSocketHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.Contains(targetHost, ":") {
 		targetHost = net.JoinHostPort(targetHost, "80")
 	}
+	r.Header.Del("Proxy-Authorization")
 
 	upstreamConn, err := upstream.DialContext(r.Context(), p.cfg(), targetHost)
 

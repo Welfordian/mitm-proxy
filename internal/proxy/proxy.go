@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"mitm-proxy/internal/access"
 	capkg "mitm-proxy/internal/ca"
 	cachepkg "mitm-proxy/internal/cache"
 	cfgpkg "mitm-proxy/internal/config"
@@ -31,6 +32,7 @@ type Proxy struct {
 	cache     *cachepkg.Cache
 	threats   *threats.Manager
 	events    *events.Bus
+	access    *access.Controller
 }
 
 // New creates a new Proxy instance with configured upstream transport.
@@ -52,6 +54,7 @@ func NewWithEvents(ca *capkg.CA, config *cfgpkg.Config, eventBus *events.Bus) *P
 	p.config.Store(config)
 	p.client.Store(upstream.NewHTTPClient(config, 0))
 	p.threats = threats.NewManager(p.cfg)
+	p.access = access.NewController(p.cfg, nil)
 	return p
 }
 
@@ -71,6 +74,10 @@ func (p *Proxy) SetCacheStore(store cachepkg.BackingStore) {
 	}
 }
 
+func (p *Proxy) SetAccessStore(store access.Store) {
+	p.access = access.NewController(p.cfg, store)
+}
+
 // cfg returns the current configuration snapshot safely.
 func (p *Proxy) cfg() *cfgpkg.Config {
 	if v := p.config.Load(); v != nil {
@@ -88,6 +95,13 @@ func (p *Proxy) httpClient() *http.Client {
 		return v.(*http.Client)
 	}
 	return upstream.NewHTTPClient(p.cfg(), 0)
+}
+
+func (p *Proxy) accessController() *access.Controller {
+	if p.access == nil {
+		p.access = access.NewController(p.cfg, nil)
+	}
+	return p.access
 }
 
 func (p *Proxy) ThreatScanner() *threats.Manager {

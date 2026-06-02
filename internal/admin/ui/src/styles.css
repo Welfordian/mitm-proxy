@@ -795,6 +795,17 @@ textarea {
   margin: 10px 0 18px;
 }
 
+.scope-badge.user {
+  background: #eef6ff;
+  color: #175cd3;
+  border-color: #b2ddff;
+}
+
+.compact-input {
+  min-width: 150px;
+  max-width: 190px;
+}
+
 .muted { color: var(--fg-2); }
 .error {
   color: var(--danger-fg);

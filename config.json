@@ -96,7 +96,17 @@
   "traffic_capture": {
     "store_bodies": true,
     "max_body_bytes": 32768,
-    "redact_bodies": true
+    "redact_bodies": true,
+    "store_headers": true,
+    "redacted_headers": [
+      "Authorization",
+      "Cookie",
+      "Proxy-Authorization",
+      "Set-Cookie",
+      "X-Api-Key"
+    ],
+    "store_cookies": true,
+    "redacted_cookies": []
   },
   "ai_copilot": {
     "enabled": true,
@@ -119,5 +129,11 @@
     ],
     "chain_tunnels": true,
     "apply_to_repeater": true
+  },
+  "proxy_auth": {
+    "enabled": false,
+    "realm": "MITM Proxy",
+    "require_auth_for_loopback": true,
+    "default_action": "allow"
   }
 }

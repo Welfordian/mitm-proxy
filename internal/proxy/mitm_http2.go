@@ -8,11 +8,12 @@ import (
 
 	"golang.org/x/net/http2"
 
+	"mitm-proxy/internal/access"
 	"mitm-proxy/internal/events"
 )
 
 // mitmHTTPS2 handles HTTPS traffic where ALPN negotiated HTTP/2.
-func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
+func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr string) {
 	defer clientTLS.Close()
 
 	h2s := &http2.Server{}
@@ -35,6 +36,16 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host string) {
 			} else {
 				req.URL.Host = host
 			}
+		}
+		req.RemoteAddr = remoteAddr
+		if proxyUser != "" {
+			req = req.WithContext(access.WithUsername(req.Context(), proxyUser))
+		}
+		accessDecision := p.accessController().AuthorizeKnownUser(req.Context(), proxyUser, remoteAddr, req.Method, req.URL.String())
+		if !accessDecision.Allowed {
+			p.publishAccessDenied(req, accessDecision)
+			writeAccessBlockedResponse(w, p.cfg(), accessDecision)
+			return
 		}
 
 		stripHopByHopHeaders(req.Header)

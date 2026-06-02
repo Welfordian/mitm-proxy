@@ -41,6 +41,8 @@ var DashboardTables = []string{
 	"research_scopes",
 	"cache_entries",
 	"ai_notes",
+	"proxy_users",
+	"proxy_acl_rules",
 }
 
 type AuditEntry struct {
@@ -59,6 +61,33 @@ type AdminUser struct {
 	CreatedAt time.Time `json:"created_at"`
 }
 
+type ProxyUser struct {
+	ID           string     `json:"id"`
+	Username     string     `json:"username"`
+	PasswordHash string     `json:"-"`
+	Enabled      bool       `json:"enabled"`
+	CreatedAt    time.Time  `json:"created_at"`
+	UpdatedAt    time.Time  `json:"updated_at"`
+	LastUsedAt   *time.Time `json:"last_used_at,omitempty"`
+}
+
+type ProxyACLRule struct {
+	ID             string    `json:"id"`
+	Priority       int       `json:"priority"`
+	Enabled        bool      `json:"enabled"`
+	Action         string    `json:"action"`
+	Name           string    `json:"name"`
+	Description    string    `json:"description,omitempty"`
+	Users          []string  `json:"users,omitempty"`
+	SourceIPs      []string  `json:"source_ips,omitempty"`
+	HostPatterns   []string  `json:"host_patterns,omitempty"`
+	PortPatterns   []string  `json:"port_patterns,omitempty"`
+	MethodPatterns []string  `json:"method_patterns,omitempty"`
+	ScopeIDs       []string  `json:"scope_ids,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
+}
+
 type TrafficFlow struct {
 	ID         string    `json:"id"`
 	CreatedAt  time.Time `json:"created_at"`
@@ -75,6 +104,7 @@ type TrafficFlow struct {
 	Blocked    bool      `json:"blocked,omitempty"`
 	RuleID     string    `json:"rule_id,omitempty"`
 	ScopeID    string    `json:"scope_id,omitempty"`
+	ProxyUser  string    `json:"proxy_user,omitempty"`
 }
 
 type HeaderRecord struct {
@@ -636,6 +666,31 @@ func (s *Store) migrate(ctx context.Context) error {
 			summary TEXT,
 			content_json TEXT NOT NULL
 		)`,
+		`CREATE TABLE IF NOT EXISTS proxy_users (
+			id TEXT PRIMARY KEY,
+			username TEXT NOT NULL UNIQUE,
+			password_hash TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			last_used_at TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS proxy_acl_rules (
+			id TEXT PRIMARY KEY,
+			priority INTEGER NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			action TEXT NOT NULL,
+			name TEXT NOT NULL,
+			description TEXT,
+			users_json TEXT NOT NULL,
+			source_ips_json TEXT NOT NULL,
+			host_patterns_json TEXT NOT NULL,
+			port_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL,
+			scope_ids_json TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -649,6 +704,7 @@ func (s *Store) migrate(ctx context.Context) error {
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "blocked", "INTEGER NOT NULL DEFAULT 0")
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "rule_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "traffic_flows", "scope_id", "TEXT")
+	_ = s.addColumnIfMissing(ctx, "traffic_flows", "proxy_user", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "repeater_cases", "scope_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "threat_events", "scope_id", "TEXT")
 	_ = s.addColumnIfMissing(ctx, "admin_users", "role", "TEXT NOT NULL DEFAULT 'read'")
@@ -915,6 +971,250 @@ func (s *Store) DeleteAdminUser(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (s *Store) CreateProxyUser(ctx context.Context, user ProxyUser) (ProxyUser, error) {
+	if s == nil {
+		return ProxyUser{}, nil
+	}
+	now := time.Now().UTC()
+	user.ID = strings.TrimSpace(user.ID)
+	if user.ID == "" {
+		user.ID = "proxy-user-" + newStoreID()
+	}
+	user.Username = strings.TrimSpace(user.Username)
+	if user.Username == "" {
+		return ProxyUser{}, fmt.Errorf("username is required")
+	}
+	if strings.TrimSpace(user.PasswordHash) == "" {
+		return ProxyUser{}, fmt.Errorf("password hash is required")
+	}
+	user.CreatedAt = now
+	user.UpdatedAt = now
+	enabled := 0
+	if user.Enabled {
+		enabled = 1
+	}
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO proxy_users (id, username, password_hash, enabled, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?)`,
+		user.ID, user.Username, user.PasswordHash, enabled, user.CreatedAt.Format(time.RFC3339Nano), user.UpdatedAt.Format(time.RFC3339Nano))
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("insert proxy user: %w", err)
+	}
+	return user, nil
+}
+
+func (s *Store) ListProxyUsers(ctx context.Context) ([]ProxyUser, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT id, username, password_hash, enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users ORDER BY username ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query proxy users: %w", err)
+	}
+	defer rows.Close()
+	users := []ProxyUser{}
+	for rows.Next() {
+		user, err := scanProxyUser(rows)
+		if err != nil {
+			return nil, err
+		}
+		users = append(users, user)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate proxy users: %w", err)
+	}
+	return users, nil
+}
+
+func (s *Store) GetProxyUser(ctx context.Context, id string) (ProxyUser, bool, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users WHERE id = ?`, id)
+	user, err := scanProxyUser(row)
+	if err == sql.ErrNoRows {
+		return ProxyUser{}, false, nil
+	}
+	if err != nil {
+		return ProxyUser{}, false, err
+	}
+	return user, true, nil
+}
+
+func (s *Store) GetProxyUserByUsername(ctx context.Context, username string) (ProxyUser, bool, error) {
+	row := s.db.QueryRowContext(ctx,
+		`SELECT id, username, password_hash, enabled, created_at, updated_at, COALESCE(last_used_at, '')
+		 FROM proxy_users WHERE username = ?`, strings.TrimSpace(username))
+	user, err := scanProxyUser(row)
+	if err == sql.ErrNoRows {
+		return ProxyUser{}, false, nil
+	}
+	if err != nil {
+		return ProxyUser{}, false, err
+	}
+	return user, true, nil
+}
+
+func (s *Store) UpdateProxyUser(ctx context.Context, user ProxyUser) (ProxyUser, error) {
+	user.Username = strings.TrimSpace(user.Username)
+	if user.ID == "" || user.Username == "" {
+		return ProxyUser{}, fmt.Errorf("proxy user id and username are required")
+	}
+	enabled := 0
+	if user.Enabled {
+		enabled = 1
+	}
+	updatedAt := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_users SET username = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+		user.Username, enabled, updatedAt.Format(time.RFC3339Nano), user.ID)
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("update proxy user: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetProxyUser(ctx, user.ID)
+	if err != nil {
+		return ProxyUser{}, err
+	}
+	if !ok {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	return stored, nil
+}
+
+func (s *Store) ResetProxyUserPassword(ctx context.Context, id, passwordHash string) (ProxyUser, error) {
+	if strings.TrimSpace(passwordHash) == "" {
+		return ProxyUser{}, fmt.Errorf("password hash is required")
+	}
+	updatedAt := time.Now().UTC()
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_users SET password_hash = ?, updated_at = ? WHERE id = ?`,
+		passwordHash, updatedAt.Format(time.RFC3339Nano), id)
+	if err != nil {
+		return ProxyUser{}, fmt.Errorf("reset proxy user password: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	user, ok, err := s.GetProxyUser(ctx, id)
+	if err != nil {
+		return ProxyUser{}, err
+	}
+	if !ok {
+		return ProxyUser{}, sql.ErrNoRows
+	}
+	return user, nil
+}
+
+func (s *Store) TouchProxyUserLastUsed(ctx context.Context, id string) error {
+	if strings.TrimSpace(id) == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx, `UPDATE proxy_users SET last_used_at = ? WHERE id = ?`,
+		time.Now().UTC().Format(time.RFC3339Nano), id)
+	if err != nil {
+		return fmt.Errorf("touch proxy user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) DeleteProxyUser(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM proxy_users WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete proxy user: %w", err)
+	}
+	return nil
+}
+
+func (s *Store) CreateProxyACLRule(ctx context.Context, rule ProxyACLRule) (ProxyACLRule, error) {
+	rule = normalizeProxyACLRule(rule)
+	now := time.Now().UTC()
+	rule.ID = strings.TrimSpace(rule.ID)
+	if rule.ID == "" {
+		rule.ID = "proxy-acl-" + newStoreID()
+	}
+	rule.CreatedAt = now
+	rule.UpdatedAt = now
+	args, err := proxyACLRuleSQLArgs(rule)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	_, err = s.db.ExecContext(ctx,
+		`INSERT INTO proxy_acl_rules
+		 (id, priority, enabled, action, name, description, users_json, source_ips_json, host_patterns_json, port_patterns_json, method_patterns_json, scope_ids_json, created_at, updated_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`, args...)
+	if err != nil {
+		return ProxyACLRule{}, fmt.Errorf("insert proxy acl rule: %w", err)
+	}
+	return rule, nil
+}
+
+func (s *Store) ListProxyACLRules(ctx context.Context) ([]ProxyACLRule, error) {
+	rows, err := s.db.QueryContext(ctx, proxyACLRuleSelect()+` ORDER BY priority ASC, created_at ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("query proxy acl rules: %w", err)
+	}
+	defer rows.Close()
+	rules := []ProxyACLRule{}
+	for rows.Next() {
+		rule, err := scanProxyACLRule(rows)
+		if err != nil {
+			return nil, err
+		}
+		rules = append(rules, rule)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate proxy acl rules: %w", err)
+	}
+	return rules, nil
+}
+
+func (s *Store) GetProxyACLRule(ctx context.Context, id string) (ProxyACLRule, bool, error) {
+	row := s.db.QueryRowContext(ctx, proxyACLRuleSelect()+` WHERE id = ?`, id)
+	rule, err := scanProxyACLRule(row)
+	if err == sql.ErrNoRows {
+		return ProxyACLRule{}, false, nil
+	}
+	if err != nil {
+		return ProxyACLRule{}, false, err
+	}
+	return rule, true, nil
+}
+
+func (s *Store) UpdateProxyACLRule(ctx context.Context, rule ProxyACLRule) (ProxyACLRule, error) {
+	rule = normalizeProxyACLRule(rule)
+	rule.UpdatedAt = time.Now().UTC()
+	args, err := proxyACLRuleSQLArgs(rule)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	updateArgs := []any{args[1], args[2], args[3], args[4], args[5], args[6], args[7], args[8], args[9], args[10], args[11], args[13], rule.ID}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE proxy_acl_rules
+		 SET priority = ?, enabled = ?, action = ?, name = ?, description = ?, users_json = ?, source_ips_json = ?, host_patterns_json = ?, port_patterns_json = ?, method_patterns_json = ?, scope_ids_json = ?, updated_at = ?
+		 WHERE id = ?`, updateArgs...)
+	if err != nil {
+		return ProxyACLRule{}, fmt.Errorf("update proxy acl rule: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ProxyACLRule{}, sql.ErrNoRows
+	}
+	stored, ok, err := s.GetProxyACLRule(ctx, rule.ID)
+	if err != nil {
+		return ProxyACLRule{}, err
+	}
+	if !ok {
+		return ProxyACLRule{}, sql.ErrNoRows
+	}
+	return stored, nil
+}
+
+func (s *Store) DeleteProxyACLRule(ctx context.Context, id string) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM proxy_acl_rules WHERE id = ?`, id); err != nil {
+		return fmt.Errorf("delete proxy acl rule: %w", err)
+	}
+	return nil
+}
+
 func (s *Store) RecordEvent(ctx context.Context, event events.Event) error {
 	if s == nil {
 		return nil
@@ -958,20 +1258,20 @@ func (s *Store) ListTrafficScopedPage(ctx context.Context, limit, offset int, sc
 
 	where, args := scopedWhere(scopeID, includeOutOfScope)
 	if search = strings.TrimSpace(search); search != "" {
-		searchWhere := `(LOWER(COALESCE(method, '')) LIKE ? OR LOWER(COALESCE(url, '')) LIKE ? OR LOWER(COALESCE(host, '')) LIKE ? OR CAST(COALESCE(status, 0) AS TEXT) LIKE ? OR LOWER(COALESCE(protocol, '')) LIKE ? OR LOWER(COALESCE(mime_type, '')) LIKE ? OR LOWER(COALESCE(rule_id, '')) LIKE ?)`
+		searchWhere := `(LOWER(COALESCE(method, '')) LIKE ? OR LOWER(COALESCE(url, '')) LIKE ? OR LOWER(COALESCE(host, '')) LIKE ? OR CAST(COALESCE(status, 0) AS TEXT) LIKE ? OR LOWER(COALESCE(protocol, '')) LIKE ? OR LOWER(COALESCE(mime_type, '')) LIKE ? OR LOWER(COALESCE(rule_id, '')) LIKE ? OR LOWER(COALESCE(proxy_user, '')) LIKE ?)`
 		if where == "" {
 			where = " WHERE " + searchWhere
 		} else {
 			where += " AND " + searchWhere
 		}
 		term := "%" + strings.ToLower(search) + "%"
-		args = append(args, term, term, term, term, term, term, term)
+		args = append(args, term, term, term, term, term, term, term, term)
 	}
 	args = append(args, limit, offset)
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
 		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
-		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, '')
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, ''), COALESCE(proxy_user, '')
 		 FROM traffic_flows`+where+` ORDER BY created_at DESC LIMIT ? OFFSET ?`, args...)
 	if err != nil {
 		return nil, fmt.Errorf("query traffic flows: %w", err)
@@ -1010,7 +1310,7 @@ func (s *Store) GetTraffic(ctx context.Context, id string) (TrafficFlow, bool, e
 	row := s.db.QueryRowContext(ctx,
 		`SELECT id, created_at, COALESCE(method, ''), COALESCE(url, ''), COALESCE(host, ''),
 		 COALESCE(status, 0), COALESCE(protocol, ''), COALESCE(mime_type, ''), COALESCE(remote_ip, ''),
-		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, '')
+		 COALESCE(duration_ms, 0), COALESCE(bytes, 0), cache_hit, blocked, COALESCE(rule_id, ''), COALESCE(scope_id, ''), COALESCE(proxy_user, '')
 		 FROM traffic_flows WHERE id = ?`, id)
 
 	flow, err := scanTrafficFlow(row)
@@ -1129,7 +1429,7 @@ func (s *Store) PurgeResearchData(ctx context.Context, includeCache bool) error 
 		"ai_notes",
 	}
 	if includeCache {
-		tables = append(tables, "cache_entries")
+		tables = append(tables, "cache_entries", "proxy_acl_rules", "proxy_users")
 	}
 
 	s.writeMu.Lock()
@@ -1737,11 +2037,122 @@ func scanAINote(row trafficScanner) (AINote, error) {
 	return normalizeAINote(note), nil
 }
 
+func scanProxyUser(row trafficScanner) (ProxyUser, error) {
+	var user ProxyUser
+	var enabled int
+	var createdAt, updatedAt, lastUsedAt string
+	if err := row.Scan(&user.ID, &user.Username, &user.PasswordHash, &enabled, &createdAt, &updatedAt, &lastUsedAt); err != nil {
+		return ProxyUser{}, err
+	}
+	user.Enabled = enabled != 0
+	user.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	user.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	if parsed, err := time.Parse(time.RFC3339Nano, lastUsedAt); err == nil {
+		user.LastUsedAt = &parsed
+	}
+	return user, nil
+}
+
+func proxyACLRuleSelect() string {
+	return `SELECT id, priority, enabled, action, name, COALESCE(description, ''), users_json, source_ips_json, host_patterns_json, port_patterns_json, method_patterns_json, scope_ids_json, created_at, updated_at FROM proxy_acl_rules`
+}
+
+func scanProxyACLRule(row trafficScanner) (ProxyACLRule, error) {
+	var rule ProxyACLRule
+	var enabled int
+	var usersJSON, sourceIPsJSON, hostJSON, portJSON, methodJSON, scopeJSON string
+	var createdAt, updatedAt string
+	if err := row.Scan(&rule.ID, &rule.Priority, &enabled, &rule.Action, &rule.Name, &rule.Description, &usersJSON, &sourceIPsJSON, &hostJSON, &portJSON, &methodJSON, &scopeJSON, &createdAt, &updatedAt); err != nil {
+		return ProxyACLRule{}, err
+	}
+	rule.Enabled = enabled != 0
+	rule.Users = unmarshalStringList(usersJSON)
+	rule.SourceIPs = unmarshalStringList(sourceIPsJSON)
+	rule.HostPatterns = unmarshalStringList(hostJSON)
+	rule.PortPatterns = unmarshalStringList(portJSON)
+	rule.MethodPatterns = unmarshalStringList(methodJSON)
+	rule.ScopeIDs = unmarshalStringList(scopeJSON)
+	rule.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
+	rule.UpdatedAt, _ = time.Parse(time.RFC3339Nano, updatedAt)
+	return normalizeProxyACLRule(rule), nil
+}
+
+func normalizeProxyACLRule(rule ProxyACLRule) ProxyACLRule {
+	rule.ID = strings.TrimSpace(rule.ID)
+	rule.Action = strings.ToLower(strings.TrimSpace(rule.Action))
+	if rule.Action == "" {
+		rule.Action = "deny"
+	}
+	rule.Name = strings.TrimSpace(rule.Name)
+	if rule.Name == "" {
+		rule.Name = rule.Action + " rule"
+	}
+	rule.Description = strings.TrimSpace(rule.Description)
+	rule.Users = normalizeStringList(rule.Users, false)
+	rule.SourceIPs = normalizeStringList(rule.SourceIPs, false)
+	rule.HostPatterns = normalizeStringList(rule.HostPatterns, true)
+	rule.PortPatterns = normalizeStringList(rule.PortPatterns, false)
+	rule.MethodPatterns = normalizeStringList(rule.MethodPatterns, true)
+	rule.ScopeIDs = normalizeStringList(rule.ScopeIDs, false)
+	return rule
+}
+
+func normalizeStringList(values []string, upper bool) []string {
+	out := []string{}
+	seen := map[string]bool{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		if upper {
+			value = strings.ToUpper(value)
+		}
+		key := strings.ToLower(value)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, value)
+	}
+	return out
+}
+
+func proxyACLRuleSQLArgs(rule ProxyACLRule) ([]any, error) {
+	if rule.Action != "allow" && rule.Action != "deny" {
+		return nil, fmt.Errorf("proxy ACL action must be allow or deny")
+	}
+	lists := [][]string{rule.Users, rule.SourceIPs, rule.HostPatterns, rule.PortPatterns, rule.MethodPatterns, rule.ScopeIDs}
+	encoded := make([]string, 0, len(lists))
+	for _, list := range lists {
+		raw, err := json.Marshal(list)
+		if err != nil {
+			return nil, fmt.Errorf("marshal proxy ACL rule: %w", err)
+		}
+		encoded = append(encoded, string(raw))
+	}
+	enabled := 0
+	if rule.Enabled {
+		enabled = 1
+	}
+	return []any{
+		rule.ID, rule.Priority, enabled, rule.Action, rule.Name, rule.Description,
+		encoded[0], encoded[1], encoded[2], encoded[3], encoded[4], encoded[5],
+		rule.CreatedAt.Format(time.RFC3339Nano), rule.UpdatedAt.Format(time.RFC3339Nano),
+	}, nil
+}
+
+func unmarshalStringList(raw string) []string {
+	out := []string{}
+	_ = json.Unmarshal([]byte(raw), &out)
+	return out
+}
+
 func scanTrafficFlow(row trafficScanner) (TrafficFlow, error) {
 	var flow TrafficFlow
 	var createdAt string
 	var cacheHit, blocked int
-	if err := row.Scan(&flow.ID, &createdAt, &flow.Method, &flow.URL, &flow.Host, &flow.Status, &flow.Protocol, &flow.MIMEType, &flow.RemoteIP, &flow.DurationMS, &flow.Bytes, &cacheHit, &blocked, &flow.RuleID, &flow.ScopeID); err != nil {
+	if err := row.Scan(&flow.ID, &createdAt, &flow.Method, &flow.URL, &flow.Host, &flow.Status, &flow.Protocol, &flow.MIMEType, &flow.RemoteIP, &flow.DurationMS, &flow.Bytes, &cacheHit, &blocked, &flow.RuleID, &flow.ScopeID, &flow.ProxyUser); err != nil {
 		return TrafficFlow{}, err
 	}
 	flow.CreatedAt, _ = time.Parse(time.RFC3339Nano, createdAt)
@@ -1759,10 +2170,10 @@ func (s *Store) recordTrafficStarted(ctx context.Context, event events.Event) er
 		return fmt.Errorf("match traffic scope: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
-		 ON CONFLICT(id) DO UPDATE SET method=excluded.method, url=excluded.url, host=excluded.host, protocol=excluded.protocol, remote_ip=excluded.remote_ip, scope_id=excluded.scope_id`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID)
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id, proxy_user)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET method=excluded.method, url=excluded.url, host=excluded.host, protocol=excluded.protocol, remote_ip=excluded.remote_ip, scope_id=excluded.scope_id, proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID, stringPayload(event, "proxy_user"))
 	if err != nil {
 		return fmt.Errorf("record traffic start: %w", err)
 	}
@@ -1781,10 +2192,10 @@ func (s *Store) recordTrafficCompleted(ctx context.Context, event events.Event) 
 		return fmt.Errorf("match traffic scope: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, status, mime_type, duration_ms, bytes, cache_hit, scope_id)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''))
-		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, mime_type=excluded.mime_type, duration_ms=excluded.duration_ms, bytes=excluded.bytes, cache_hit=excluded.cache_hit, scope_id=COALESCE(excluded.scope_id, traffic_flows.scope_id)`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, intPayload(event, "status"), stringPayload(event, "mime_type"), intPayload(event, "duration_ms"), intPayload(event, "bytes"), boolPayload(event, "cache_hit"), scopeID)
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, status, mime_type, duration_ms, bytes, cache_hit, scope_id, proxy_user)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET status=excluded.status, mime_type=excluded.mime_type, duration_ms=excluded.duration_ms, bytes=excluded.bytes, cache_hit=excluded.cache_hit, scope_id=COALESCE(excluded.scope_id, traffic_flows.scope_id), proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, intPayload(event, "status"), stringPayload(event, "mime_type"), intPayload(event, "duration_ms"), intPayload(event, "bytes"), boolPayload(event, "cache_hit"), scopeID, stringPayload(event, "proxy_user"))
 	if err != nil {
 		return fmt.Errorf("record traffic completion: %w", err)
 	}
@@ -1805,9 +2216,9 @@ func (s *Store) recordTunnelOpened(ctx context.Context, event events.Event) erro
 		return fmt.Errorf("match tunnel scope: %w", err)
 	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id)
-		 VALUES (?, ?, 'CONNECT', ?, ?, ?, ?, NULLIF(?, ''))`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), target, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID)
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, protocol, remote_ip, scope_id, proxy_user)
+		 VALUES (?, ?, 'CONNECT', ?, ?, ?, ?, NULLIF(?, ''), NULLIF(?, ''))`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), target, host, stringPayload(event, "protocol"), stringPayload(event, "remote_ip"), scopeID, stringPayload(event, "proxy_user"))
 	if err != nil {
 		return fmt.Errorf("record tunnel: %w", err)
 	}
@@ -1861,11 +2272,15 @@ func (s *Store) recordTrafficBlocked(ctx context.Context, event events.Event) er
 	if err != nil {
 		return fmt.Errorf("match blocked traffic scope: %w", err)
 	}
+	status := intPayload(event, "status")
+	if status == 0 {
+		status = 403
+	}
 	_, err = s.db.ExecContext(ctx,
-		`INSERT INTO traffic_flows (id, created_at, method, url, host, blocked, rule_id, status, scope_id)
-		 VALUES (?, ?, ?, ?, ?, 1, ?, 403, NULLIF(?, ''))
-		 ON CONFLICT(id) DO UPDATE SET blocked=1, rule_id=excluded.rule_id, status=excluded.status, scope_id=excluded.scope_id`,
-		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "rule_id"), scopeID)
+		`INSERT INTO traffic_flows (id, created_at, method, url, host, blocked, rule_id, status, scope_id, proxy_user, remote_ip)
+		 VALUES (?, ?, ?, ?, ?, 1, ?, ?, NULLIF(?, ''), NULLIF(?, ''), NULLIF(?, ''))
+		 ON CONFLICT(id) DO UPDATE SET blocked=1, rule_id=excluded.rule_id, status=excluded.status, scope_id=excluded.scope_id, proxy_user=COALESCE(excluded.proxy_user, traffic_flows.proxy_user), remote_ip=COALESCE(excluded.remote_ip, traffic_flows.remote_ip)`,
+		flowID(event), event.Time.Format(time.RFC3339Nano), method, rawURL, host, stringPayload(event, "rule_id"), status, scopeID, stringPayload(event, "proxy_user"), stringPayload(event, "remote_ip"))
 	if err != nil {
 		return fmt.Errorf("record blocked traffic: %w", err)
 	}

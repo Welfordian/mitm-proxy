@@ -143,6 +143,7 @@ func main() {
 	eventBus := events.NewBus(256)
 	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
 	proxy.SetCacheStore(cacheStore)
+	proxy.SetAccessStore(cacheStore)
 	var proxyServer *http.Server
 	var adminServer *adminpkg.Server
 	var restartMu sync.Mutex

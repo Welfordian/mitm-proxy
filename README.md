@@ -159,7 +159,17 @@ By using this software, **you acknowledge and accept full responsibility** for e
   "traffic_capture": {
     "store_bodies": false,
     "max_body_bytes": 32768,
-    "redact_bodies": true
+    "redact_bodies": true,
+    "store_headers": true,
+    "redacted_headers": ["Authorization", "Cookie", "Proxy-Authorization", "Set-Cookie", "X-Api-Key"],
+    "store_cookies": true,
+    "redacted_cookies": []
+  },
+  "proxy_auth": {
+    "enabled": false,
+    "realm": "MITM Proxy",
+    "require_auth_for_loopback": false,
+    "default_action": "allow"
   },
   "verbose_logging": true,
   "log_requests": true,
@@ -186,6 +196,8 @@ By using this software, **you acknowledge and accept full responsibility** for e
 - admin_addr defaults to localhost. If admin_token is empty, a per-run token is generated and printed at startup.
 - admin_read_token can be set for read-only dashboard/API clients.
 - traffic_capture.store_bodies is disabled by default; when enabled, body samples are size-limited and redacted by default.
+- traffic_capture.store_headers and traffic_capture.store_cookies control whether captured metadata is persisted. redacted_headers redacts entire header values, while redacted_cookies redacts matching individual Cookie and Set-Cookie names before storage.
+- proxy_auth enables Basic client proxy authentication backed by SQLite-managed users and ordered ACL rules.
 - blocked_domains supports exact names and wildcard patterns such as *.example.com; blocked_ips supports single IPs and CIDR ranges.
 - cache.include_domains and cache.exclude_domains are mutually exclusive, same for include_extensions vs exclude_extensions.
 - The watcher only monitors the file given to --config or the default ./config.json, and applies changes hot via Proxy.SetConfig.
@@ -202,6 +214,7 @@ Initial dashboard/API coverage includes:
 - GET /api/traffic/export?format=har for HAR-style export
 - GET/POST/PUT/DELETE /api/repeater/cases and POST /api/repeater/cases/{id}/send for saved editable replay cases
 - GET/POST/PUT/DELETE /api/scopes plus scope assignment endpoints for traffic and repeater cases
+- GET/POST/PUT/DELETE /api/proxy-auth/users and /api/proxy-acl/rules plus POST /api/proxy-acl/test for proxy client access control
 - POST /api/ai/traffic/{id}/explain, POST /api/ai/traffic/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/suggest-tests, POST /api/ai/repeater/cases/{id}/compare-runs, and GET/POST/DELETE /api/ai/notes for AI research copilot notes
 - GET /api/certificates/ca, GET /api/certificates/ca/download, POST /api/certificates/ca/rotate, POST /api/certificates/ca/import, and GET /api/certificates/leaf
 - GET/POST/DELETE block rules for ports, domains, and IPs
@@ -240,6 +253,14 @@ Outbound traffic can be chained through an upstream HTTP or HTTPS proxy, such as
 ```
 
 Only `http://` and `https://` upstream proxy URLs are supported in v1. If Basic auth is needed, set `username` and provide the password through the named environment variable; credentials embedded in the URL are rejected and are never shown in dashboard settings. If the upstream proxy is enabled but unavailable, affected requests fail visibly instead of silently falling back to direct connections.
+
+### Proxy Access Control
+
+The dashboard's **Access Control** view manages client proxy users and ordered allow/deny ACL rules. Proxy users are stored in SQLite with bcrypt password hashes; plaintext passwords are accepted only when creating or resetting a user and are never returned by the API.
+
+Enable Basic proxy authentication through `proxy_auth` in `config.json` or the Settings view. When enabled, clients must send `Proxy-Authorization: Basic ...` unless loopback clients are exempt. ACL rules are evaluated by priority and can match username, source IP/CIDR, host or wildcard host, port or port range, method, and research scope. Empty matcher lists mean "any".
+
+`Proxy-Authorization` is stripped before forwarding, upstream chaining, traffic capture, cache lookup, threat scanning, and Repeater cloning. Captured traffic includes `proxy_user` attribution when available, and the Traffic search box can match proxy usernames.
 
 ### Research Repeater
 

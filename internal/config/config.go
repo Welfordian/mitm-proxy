@@ -73,6 +73,9 @@ type Config struct {
 	// Upstream proxy chains outbound traffic through another HTTP(S) proxy.
 	UpstreamProxy UpstreamProxyConfig `json:"upstream_proxy"`
 
+	// ProxyAuth controls client authentication and ACL enforcement for proxy traffic.
+	ProxyAuth ProxyAuthConfig `json:"proxy_auth"`
+
 	// Traffic capture controls body persistence for dashboard inspection.
 	TrafficCapture TrafficCaptureConfig `json:"traffic_capture"`
 
@@ -148,10 +151,21 @@ type UpstreamProxyConfig struct {
 	ApplyToRepeater bool     `json:"apply_to_repeater"`
 }
 
+type ProxyAuthConfig struct {
+	Enabled                bool   `json:"enabled"`
+	Realm                  string `json:"realm"`
+	RequireAuthForLoopback bool   `json:"require_auth_for_loopback"`
+	DefaultAction          string `json:"default_action"`
+}
+
 type TrafficCaptureConfig struct {
-	StoreBodies  bool  `json:"store_bodies"`
-	MaxBodyBytes int64 `json:"max_body_bytes"`
-	RedactBodies bool  `json:"redact_bodies"`
+	StoreBodies     bool     `json:"store_bodies"`
+	MaxBodyBytes    int64    `json:"max_body_bytes"`
+	RedactBodies    bool     `json:"redact_bodies"`
+	StoreHeaders    bool     `json:"store_headers"`
+	RedactedHeaders []string `json:"redacted_headers"`
+	StoreCookies    bool     `json:"store_cookies"`
+	RedactedCookies []string `json:"redacted_cookies"`
 }
 
 // defaultConfig returns a Config with sensible defaults.
@@ -187,11 +201,24 @@ func defaultConfig() *Config {
 		ThreatScanner: defaultThreatScannerConfig(),
 		AICopilot:     defaultAICopilotConfig(),
 		UpstreamProxy: defaultUpstreamProxyConfig(),
+		ProxyAuth:     defaultProxyAuthConfig(),
 		TrafficCapture: TrafficCaptureConfig{
-			StoreBodies:  false,
-			MaxBodyBytes: 32768,
-			RedactBodies: true,
+			StoreBodies:     false,
+			MaxBodyBytes:    32768,
+			RedactBodies:    true,
+			StoreHeaders:    true,
+			RedactedHeaders: defaultRedactedHeaders(),
+			StoreCookies:    true,
 		},
+	}
+}
+
+func defaultProxyAuthConfig() ProxyAuthConfig {
+	return ProxyAuthConfig{
+		Enabled:                false,
+		Realm:                  "MITM Proxy",
+		RequireAuthForLoopback: false,
+		DefaultAction:          "",
 	}
 }
 
@@ -308,6 +335,7 @@ func Load(path string) (*Config, error) {
 	applyThreatScannerDefaults(&cfg.ThreatScanner)
 	applyAICopilotDefaults(&cfg.AICopilot, cfg.ThreatScanner)
 	applyUpstreamProxyDefaults(&cfg.UpstreamProxy)
+	applyProxyAuthDefaults(&cfg.ProxyAuth)
 	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
 
 	if strings.TrimSpace(cfg.AdminAddr) == "" {
@@ -343,10 +371,27 @@ func Load(path string) (*Config, error) {
 	if err := cfg.ValidateUpstreamProxy(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateProxyAuth(); err != nil {
+		return nil, err
+	}
 
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+func applyProxyAuthDefaults(c *ProxyAuthConfig) {
+	defaults := defaultProxyAuthConfig()
+	if c.Realm == "" {
+		c.Realm = defaults.Realm
+	}
+	if c.DefaultAction == "" {
+		if c.Enabled {
+			c.DefaultAction = "deny"
+		} else {
+			c.DefaultAction = "allow"
+		}
+	}
 }
 
 func applyUpstreamProxyDefaults(c *UpstreamProxyConfig) {
@@ -357,6 +402,20 @@ func applyUpstreamProxyDefaults(c *UpstreamProxyConfig) {
 	if c.NoProxy == nil {
 		c.NoProxy = defaults.NoProxy
 	}
+}
+
+func (c *Config) ValidateProxyAuth() error {
+	action := strings.ToLower(strings.TrimSpace(c.ProxyAuth.DefaultAction))
+	if action == "" {
+		return nil
+	}
+	if action != "allow" && action != "deny" {
+		return fmt.Errorf("invalid config: proxy_auth.default_action must be allow or deny")
+	}
+	if strings.ContainsAny(c.ProxyAuth.Realm, "\r\n\"") {
+		return fmt.Errorf("invalid config: proxy_auth.realm must not contain quotes or newlines")
+	}
+	return nil
 }
 
 func applyAICopilotDefaults(c *AICopilotConfig, scanner ThreatScannerConfig) {
@@ -442,9 +501,45 @@ func applyTrafficCaptureDefaults(c *TrafficCaptureConfig) {
 	if c.MaxBodyBytes == 0 {
 		c.MaxBodyBytes = 32768
 	}
+	if c.RedactedHeaders == nil {
+		c.RedactedHeaders = defaultRedactedHeaders()
+	}
+	c.RedactedHeaders = cleanStringList(c.RedactedHeaders)
+	c.RedactedCookies = cleanStringList(c.RedactedCookies)
 	if !c.StoreBodies {
 		c.RedactBodies = true
 	}
+}
+
+func defaultRedactedHeaders() []string {
+	return []string{
+		"Authorization",
+		"Cookie",
+		"Proxy-Authorization",
+		"Set-Cookie",
+		"X-Api-Key",
+	}
+}
+
+func cleanStringList(values []string) []string {
+	if values == nil {
+		return nil
+	}
+	out := make([]string, 0, len(values))
+	seen := map[string]struct{}{}
+	for _, value := range values {
+		value = strings.TrimSpace(value)
+		if value == "" {
+			continue
+		}
+		key := strings.ToLower(value)
+		if _, ok := seen[key]; ok {
+			continue
+		}
+		seen[key] = struct{}{}
+		out = append(out, value)
+	}
+	return out
 }
 
 func applyThreatScannerDefaults(c *ThreatScannerConfig) {

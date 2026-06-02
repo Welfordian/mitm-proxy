@@ -11,12 +11,13 @@ import (
 	"strings"
 	"time"
 
+	"mitm-proxy/internal/access"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/upstream"
 )
 
 // mitmHTTPS11 handles HTTPS traffic where ALPN negotiated HTTP/1.1.
-func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
+func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr string) {
 	reader := bufio.NewReader(clientTLS)
 
 	for {
@@ -39,7 +40,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 
 		if isWebSocketRequest(req) {
 			p.logVerbose("Detected wss:// WebSocket upgrade to %s", host)
-			p.handleWebSocketHTTPS11(clientTLS, req, host)
+			p.handleWebSocketHTTPS11(clientTLS, req, host, proxyUser, remoteAddr)
 
 			return
 		}
@@ -60,6 +61,17 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 			} else {
 				req.URL.Host = host
 			}
+		}
+		req.RemoteAddr = remoteAddr
+		if proxyUser != "" {
+			req = req.WithContext(access.WithUsername(req.Context(), proxyUser))
+		}
+		accessDecision := p.accessController().AuthorizeKnownUser(req.Context(), proxyUser, remoteAddr, req.Method, req.URL.String())
+		if !accessDecision.Allowed {
+			p.publishAccessDenied(req, accessDecision)
+			blocked := accessBlockedResponse(p.cfg(), accessDecision)
+			_ = blocked.Write(clientTLS)
+			continue
 		}
 
 		stripHopByHopHeaders(req.Header)
@@ -182,7 +194,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host string) {
 }
 
 // handleWebSocketHTTPS11 proxies a wss:// WebSocket over the established TLS MITM.
-func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, host string) {
+func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, host, proxyUser, remoteAddr string) {
 	targetHost := req.URL.Host
 
 	if targetHost == "" {
@@ -196,6 +208,19 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 	if !strings.Contains(targetHost, ":") {
 		targetHost = net.JoinHostPort(targetHost, "443")
 	}
+	req.RemoteAddr = remoteAddr
+	if proxyUser != "" {
+		req = req.WithContext(access.WithUsername(req.Context(), proxyUser))
+	}
+	accessDecision := p.accessController().AuthorizeKnownUser(req.Context(), proxyUser, remoteAddr, req.Method, "https://"+targetHost+req.URL.RequestURI())
+	if !accessDecision.Allowed {
+		p.publishAccessDenied(req, accessDecision)
+		blocked := accessBlockedResponse(p.cfg(), accessDecision)
+		_ = blocked.Write(clientTLS)
+		clientTLS.Close()
+		return
+	}
+	req.Header.Del("Proxy-Authorization")
 
 	rawUpstream, err := upstream.DialContext(req.Context(), p.cfg(), targetHost)
 
