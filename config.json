@@ -100,10 +100,7 @@
     "store_headers": true,
     "redacted_headers": [
       "Authorization",
-      "Cookie",
-      "Proxy-Authorization",
-      "Set-Cookie",
-      "X-Api-Key"
+      "Proxy-Authorization"
     ],
     "store_cookies": true,
     "redacted_cookies": []
