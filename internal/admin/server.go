@@ -1,6 +1,8 @@
 package admin
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -636,6 +638,7 @@ func (s *Server) handleTrafficDetail(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if ok {
+			decodeTrafficBodiesForDisplay(&flow)
 			writeJSON(w, http.StatusOK, flow)
 			return
 		}
@@ -664,6 +667,7 @@ func (s *Server) handleTrafficDetailExport(w http.ResponseWriter, r *http.Reques
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
 		return
 	}
+	decodeTrafficBodiesForDisplay(&flow)
 	if r.URL.Query().Get("format") == "har" {
 		writeDownloadJSON(w, http.StatusOK, "traffic-"+safeFilenamePart(id)+".har", trafficDetailHAR(flow))
 		return
@@ -707,6 +711,7 @@ func (s *Server) handleTrafficReplay(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, run.Error, http.StatusBadGateway)
 		return
 	}
+	decodeRepeaterRunForDisplay(&run)
 	s.audit(r, "traffic.replay", map[string]any{"id": id, "status": run.Status})
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":             run.Status,
@@ -790,6 +795,7 @@ func (s *Server) handleRepeaterCaseDetail(w http.ResponseWriter, r *http.Request
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
+		decodeRepeaterRunsForDisplay(runs)
 		writeJSON(w, http.StatusOK, store.RepeaterCaseDetail{Case: c, Runs: runs})
 	case http.MethodPut:
 		var input repeaterCaseInput
@@ -849,6 +855,7 @@ func (s *Server) handleRepeaterSend(w http.ResponseWriter, r *http.Request, id s
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	decodeRepeaterRunForDisplay(&stored)
 	s.audit(r, "repeater.case.send", map[string]any{"id": id, "run_id": stored.ID, "status": stored.Status, "error": stored.Error})
 	writeJSON(w, http.StatusOK, stored)
 }
@@ -878,6 +885,7 @@ func (s *Server) handleAITraffic(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": "traffic flow not found"})
 		return
 	}
+	decodeTrafficBodiesForDisplay(&flow)
 	var kind string
 	switch action {
 	case "explain":
@@ -928,6 +936,7 @@ func (s *Server) handleAIRepeater(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, err.Error(), http.StatusInternalServerError)
 		return
 	}
+	decodeRepeaterRunsForDisplay(runs)
 	var kind string
 	var context any
 	switch action {
@@ -1170,6 +1179,55 @@ func splitTrafficHeaders(records []store.HeaderRecord) (http.Header, http.Header
 		requestHeaders.Add(record.Name, record.Value)
 	}
 	return requestHeaders, responseHeaders
+}
+
+func decodeTrafficBodiesForDisplay(flow *store.TrafficDetail) {
+	if flow == nil {
+		return
+	}
+	requestHeaders, responseHeaders := splitTrafficHeaders(flow.Headers)
+	flow.RequestBody = decodeBodyForDisplay(flow.RequestBody, requestHeaders)
+	flow.ResponseBody = decodeBodyForDisplay(flow.ResponseBody, responseHeaders)
+}
+
+func decodeRepeaterRunsForDisplay(runs []store.RepeaterRun) {
+	for i := range runs {
+		decodeRepeaterRunForDisplay(&runs[i])
+	}
+}
+
+func decodeRepeaterRunForDisplay(run *store.RepeaterRun) {
+	if run == nil {
+		return
+	}
+	run.ResponseBody = decodeBodyForDisplay(run.ResponseBody, http.Header(run.ResponseHeaders))
+}
+
+func decodeBodyForDisplay(body string, headers http.Header) string {
+	if body == "" || !contentEncodingIncludes(headers, "gzip") {
+		return body
+	}
+	reader, err := gzip.NewReader(bytes.NewReader([]byte(body)))
+	if err != nil {
+		return body
+	}
+	defer reader.Close()
+	decoded, err := io.ReadAll(reader)
+	if err != nil {
+		return body
+	}
+	return string(decoded)
+}
+
+func contentEncodingIncludes(headers http.Header, encoding string) bool {
+	for _, value := range headers.Values("Content-Encoding") {
+		for _, part := range strings.Split(value, ",") {
+			if strings.EqualFold(strings.TrimSpace(part), encoding) {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func redactedHeaders(headers http.Header, enabled bool) http.Header {
