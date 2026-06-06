@@ -103,10 +103,29 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 
 	stripHopByHopHeaders(req.Header)
 	p.publishTrafficStarted(requestID, req, "http/1.1")
+	effectiveCfg := p.effectiveConfigForRequest(req)
 
-	if decision := p.checkPolicy(req.URL.Host); decision.Blocked {
+	if result := p.applyRequestFault(req.Context(), req, requestID); result.Handled {
+		for k, vals := range result.Headers {
+			for _, v := range vals {
+				w.Header().Add(k, v)
+			}
+		}
+		if result.Status == 0 {
+			result.Status = http.StatusServiceUnavailable
+		}
+		w.WriteHeader(result.Status)
+		n, _ := w.Write(result.Body)
+		if result.Rule.Action == "drop" {
+			p.publishBlocked(requestID, req, result.Rule.ID, "dropped by fault injection")
+		}
+		p.publishTrafficCompleted(requestID, req, result.Status, n, time.Since(start), false, result.Headers)
+		return
+	}
+
+	if decision := p.checkPolicyWithConfig(effectiveCfg, req.URL.Host); decision.Blocked {
 		p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
-		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, threatsFromPolicy(decision))
+		writeThreatBlockedResponse(w, effectiveCfg.BlockResponseStatus, threatsFromPolicy(decision))
 		return
 	}
 	dropped, err := p.interceptRequest(req.Context(), req, requestID)
@@ -131,6 +150,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		if cr, hashHex, err := p.cache.LoadContext(req.Context(), req.URL); err == nil && cr != nil {
 			p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
 			cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone(), Body: io.NopCloser(strings.NewReader(""))}
+			cr.Body = p.applyBufferedResponseFault(req.Context(), req, cachedResp, cr.Body, requestID)
 			verdict, scanErr := p.scanBufferedResponse(req.Context(), req, cachedResp, cr.Body)
 			if p.shouldBlock(verdict, scanErr) {
 				writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
@@ -172,7 +192,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 	}
 
-	resp, err := p.httpClient().Do(req)
+	resp, err := p.httpClientForConfig(effectiveCfg).Do(req)
 
 	if err != nil {
 		log.Printf("HTTP proxy error: %v", err)
@@ -190,6 +210,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	if p.cache != nil && p.cache.ShouldConsider(req) {
 		// read fully to cache
 		bodyBuf, _ = io.ReadAll(resp.Body)
+		bodyBuf = p.applyBufferedResponseFault(req.Context(), req, resp, bodyBuf, requestID)
 		verdict, scanErr := p.scanBufferedResponse(req.Context(), req, resp, bodyBuf)
 		if p.shouldBlock(verdict, scanErr) {
 			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
@@ -228,6 +249,7 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 		return
 	}
+	p.wrapStreamingResponseFault(req.Context(), req, resp, requestID)
 	dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
 	if err != nil {
 		http.Error(w, "intercept error", http.StatusBadGateway)

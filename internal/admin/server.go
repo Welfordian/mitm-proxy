@@ -110,6 +110,13 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/intercept/pending/", s.handleInterceptPendingDetail)
 	apiMux.HandleFunc("/api/websockets/connections", s.handleWebSocketConnections)
 	apiMux.HandleFunc("/api/websockets/connections/", s.handleWebSocketConnectionDetail)
+	apiMux.HandleFunc("/api/faults/rules", s.handleFaultRules)
+	apiMux.HandleFunc("/api/faults/rules/", s.handleFaultRuleDetail)
+	apiMux.HandleFunc("/api/faults/test", s.handleFaultTest)
+	apiMux.HandleFunc("/api/host-profiles", s.handleHostProfiles)
+	apiMux.HandleFunc("/api/host-profiles/", s.handleHostProfileDetail)
+	apiMux.HandleFunc("/api/host-profiles/test", s.handleHostProfileTest)
+	apiMux.HandleFunc("/api/timeline", s.handleTimeline)
 	apiMux.HandleFunc("/api/ai/traffic/", s.handleAITraffic)
 	apiMux.HandleFunc("/api/ai/repeater/cases/", s.handleAIRepeater)
 	apiMux.HandleFunc("/api/ai/notes", s.handleAINotes)
@@ -1220,6 +1227,226 @@ func (s *Server) publishWebSocketFrame(frame store.WebSocketFrame) {
 			},
 		},
 	})
+}
+
+func (s *Server) handleFaultRules(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.options.Store.ListFaultInjectionRules(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rules)
+	case http.MethodPost:
+		var rule store.FaultInjectionRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		created, err := s.options.Store.CreateFaultInjectionRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "fault.rule.create", map[string]any{"id": created.ID, "action": created.Action})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleFaultRuleDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/faults/rules/"), "/")
+	switch r.Method {
+	case http.MethodPut:
+		var rule store.FaultInjectionRule
+		if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		rule.ID = id
+		updated, err := s.options.Store.UpdateFaultInjectionRule(r.Context(), rule)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "fault.rule.update", map[string]any{"id": updated.ID, "action": updated.Action})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteFaultInjectionRule(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "fault.rule.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleFaultTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Phase   string `json:"phase"`
+		Method  string `json:"method"`
+		URL     string `json:"url"`
+		Host    string `json:"host"`
+		ScopeID string `json:"scope_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	rule, matched, err := s.options.Store.MatchFaultInjectionRule(r.Context(), input.Phase, store.RequestMatch{Method: input.Method, URL: input.URL, Host: input.Host, ScopeID: input.ScopeID})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"matched": matched, "rule": rule})
+}
+
+func (s *Server) handleHostProfiles(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		profiles, err := s.options.Store.ListHostProfiles(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, profiles)
+	case http.MethodPost:
+		var profile store.HostProfile
+		if err := json.NewDecoder(r.Body).Decode(&profile); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		created, err := s.options.Store.CreateHostProfile(r.Context(), profile)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "host_profile.create", map[string]any{"id": created.ID, "name": created.Name})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleHostProfileDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.Trim(strings.TrimPrefix(r.URL.Path, "/api/host-profiles/"), "/")
+	switch r.Method {
+	case http.MethodPut:
+		var profile store.HostProfile
+		if err := json.NewDecoder(r.Body).Decode(&profile); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		profile.ID = id
+		updated, err := s.options.Store.UpdateHostProfile(r.Context(), profile)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "host_profile.update", map[string]any{"id": updated.ID, "name": updated.Name})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteHostProfile(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "host_profile.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"deleted": id})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleHostProfileTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	var input struct {
+		Method string `json:"method"`
+		URL    string `json:"url"`
+		Host   string `json:"host"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return
+	}
+	profile, matched, err := s.options.Store.MatchHostProfile(r.Context(), store.RequestMatch{Method: input.Method, URL: input.URL, Host: input.Host})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"matched":   matched,
+		"profile":   profile,
+		"overrides": profile.Overrides,
+	})
+}
+
+func (s *Server) handleTimeline(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit, offset := paginationParams(r, 200)
+	entries, err := s.options.Store.ListTimelineEntries(r.Context(), store.TimelineFilter{
+		Limit:     limit,
+		Offset:    offset,
+		Query:     r.URL.Query().Get("q"),
+		ScopeID:   r.URL.Query().Get("scope_id"),
+		Kind:      r.URL.Query().Get("kind"),
+		Host:      r.URL.Query().Get("host"),
+		RequestID: r.URL.Query().Get("request_id"),
+	})
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, entries)
 }
 
 func (s *Server) handleAITraffic(w http.ResponseWriter, r *http.Request) {

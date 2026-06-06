@@ -51,6 +51,9 @@ var DashboardTables = []string{
 	"intercept_pending",
 	"websocket_connections",
 	"websocket_frames",
+	"fault_injection_rules",
+	"host_profiles",
+	"timeline_entries",
 }
 
 type AuditEntry struct {
@@ -149,6 +152,35 @@ type TrafficStats struct {
 	Total    int64 `json:"total"`
 	Blocked  int64 `json:"blocked"`
 	CacheHit int64 `json:"cache_hit"`
+}
+
+type TimelineEntry struct {
+	ID           string          `json:"id"`
+	CreatedAt    time.Time       `json:"created_at"`
+	Kind         string          `json:"kind"`
+	Topic        string          `json:"topic"`
+	RequestID    string          `json:"request_id,omitempty"`
+	FlowID       string          `json:"flow_id,omitempty"`
+	ConnectionID string          `json:"connection_id,omitempty"`
+	ScopeID      string          `json:"scope_id,omitempty"`
+	Host         string          `json:"host,omitempty"`
+	Method       string          `json:"method,omitempty"`
+	URL          string          `json:"url,omitempty"`
+	Status       int             `json:"status,omitempty"`
+	DurationMS   int64           `json:"duration_ms,omitempty"`
+	Summary      string          `json:"summary"`
+	Severity     string          `json:"severity,omitempty"`
+	Metadata     json.RawMessage `json:"metadata_json,omitempty"`
+}
+
+type TimelineFilter struct {
+	Limit     int
+	Offset    int
+	Query     string
+	ScopeID   string
+	Kind      string
+	Host      string
+	RequestID string
 }
 
 type RepeaterCase struct {
@@ -944,6 +976,57 @@ func (s *Store) migrate(ctx context.Context) error {
 			truncated INTEGER NOT NULL DEFAULT 0,
 			injected INTEGER NOT NULL DEFAULT 0
 		)`,
+		`CREATE TABLE IF NOT EXISTS fault_injection_rules (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			priority INTEGER NOT NULL,
+			phase TEXT NOT NULL,
+			action TEXT NOT NULL,
+			host_patterns_json TEXT NOT NULL,
+			url_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL,
+			scope_ids_json TEXT NOT NULL,
+			delay_ms INTEGER NOT NULL DEFAULT 0,
+			throttle_bytes_per_second INTEGER NOT NULL DEFAULT 0,
+			corrupt_probability REAL NOT NULL DEFAULT 0,
+			corrupt_mode TEXT,
+			synthetic_status INTEGER NOT NULL DEFAULT 0,
+			synthetic_headers_json TEXT NOT NULL,
+			synthetic_body TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS host_profiles (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			priority INTEGER NOT NULL,
+			host_patterns_json TEXT NOT NULL,
+			url_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL,
+			overrides_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS timeline_entries (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			kind TEXT NOT NULL,
+			topic TEXT NOT NULL,
+			request_id TEXT,
+			flow_id TEXT,
+			connection_id TEXT,
+			scope_id TEXT,
+			host TEXT,
+			method TEXT,
+			url TEXT,
+			status INTEGER,
+			duration_ms INTEGER,
+			summary TEXT NOT NULL,
+			severity TEXT,
+			metadata_json TEXT NOT NULL
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -967,6 +1050,11 @@ func (s *Store) migrate(ctx context.Context) error {
 	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_websocket_frames_conn_time ON websocket_frames(connection_id, created_at)`)
 	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_traffic_headers_flow_name ON traffic_headers(flow_id, name)`)
 	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_threat_events_url_host ON threat_events(url, host)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_fault_rules_priority ON fault_injection_rules(enabled, priority)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_host_profiles_priority ON host_profiles(enabled, priority)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_timeline_created ON timeline_entries(created_at DESC)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_timeline_request ON timeline_entries(request_id, created_at)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_timeline_kind_host ON timeline_entries(kind, host, created_at)`)
 
 	return nil
 }
@@ -1727,22 +1815,28 @@ func (s *Store) RecordEvent(ctx context.Context, event events.Event) error {
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
 
+	var err error
 	switch event.Topic {
 	case events.TopicTrafficRequestStarted:
-		return s.recordTrafficStarted(ctx, event)
+		err = s.recordTrafficStarted(ctx, event)
 	case events.TopicTrafficResponseCompleted:
-		return s.recordTrafficCompleted(ctx, event)
+		err = s.recordTrafficCompleted(ctx, event)
 	case events.TopicTrafficTunnelOpened:
-		return s.recordTunnelOpened(ctx, event)
+		err = s.recordTunnelOpened(ctx, event)
 	case events.TopicTrafficBlocked:
-		return s.recordTrafficBlocked(ctx, event)
+		err = s.recordTrafficBlocked(ctx, event)
 	case events.TopicTrafficBodyCaptured:
-		return s.recordTrafficBody(ctx, event)
+		err = s.recordTrafficBody(ctx, event)
 	case events.TopicCertGenerated:
-		return s.recordCertificate(ctx, event)
-	default:
-		return nil
+		err = s.recordCertificate(ctx, event)
 	}
+	if err != nil {
+		return err
+	}
+	if _, _, err := s.RecordTimelineEvent(ctx, event); err != nil {
+		return err
+	}
+	return nil
 }
 
 func (s *Store) ListTraffic(ctx context.Context, limit int) ([]TrafficFlow, error) {

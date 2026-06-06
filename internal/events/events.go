@@ -22,6 +22,9 @@ const (
 	TopicDeploymentUpdated        = "deployment.updated"
 	TopicCacheHit                 = "cache.hit"
 	TopicCacheMiss                = "cache.miss"
+	TopicFaultInjected           = "fault.injected"
+	TopicTimelineEntry           = "timeline.entry"
+	TopicHostProfileMatched      = "host_profile.matched"
 )
 
 type Event struct {

@@ -146,6 +146,7 @@ func main() {
 	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
 	proxy.SetCacheStore(cacheStore)
 	proxy.SetAccessStore(cacheStore)
+	proxy.SetResilienceStore(cacheStore)
 	interceptManager := intercept.NewManager(proxy.CurrentConfig, cacheStore, eventBus)
 	proxy.SetInterceptManager(interceptManager)
 	webSocketManager := wsinspect.NewManager(cacheStore)

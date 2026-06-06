@@ -11,13 +11,18 @@ import (
 	"strings"
 
 	"mitm-proxy/internal/access"
+	cfgpkg "mitm-proxy/internal/config"
 	"mitm-proxy/internal/events"
 	"mitm-proxy/internal/upstream"
 )
 
 // tunnelTCP relays raw bytes between client and target.
 func tunnelTCP(ctx context.Context, clientConn net.Conn, target string, p *Proxy) {
-	upstream, err := upstream.DialContext(ctx, p.cfg(), target)
+	tunnelTCPWithConfig(ctx, clientConn, target, p, p.cfg())
+}
+
+func tunnelTCPWithConfig(ctx context.Context, clientConn net.Conn, target string, p *Proxy, cfg *cfgpkg.Config) {
+	upstream, err := upstream.DialContext(ctx, cfg, target)
 
 	if err != nil {
 		log.Printf("CONNECT tunnel dial error to %s: %v", target, err)
@@ -67,8 +72,9 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	proxyUser := accessDecision.Username
+	effectiveCfg := p.effectiveConfigForHost(r.Context(), host)
 
-	if decision := p.checkPolicy(hostPort); decision.Blocked {
+	if decision := p.checkPolicyWithConfig(effectiveCfg, hostPort); decision.Blocked {
 		p.publish(events.TopicTrafficBlocked, map[string]any{
 			"method":     r.Method,
 			"target":     hostPort,
@@ -78,7 +84,7 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 			"remote_ip":  remoteIP(r.RemoteAddr),
 			"proxy_user": proxyUser,
 		}, "")
-		http.Error(w, decision.Reason, p.cfg().BlockResponseStatus)
+		http.Error(w, decision.Reason, effectiveCfg.BlockResponseStatus)
 		return
 	}
 
@@ -108,27 +114,27 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if p.cfg().IsDomainExcluded(host) {
+	if effectiveCfg.IsDomainExcluded(host) {
 		p.logVerbose("Domain %s is excluded, using plain tunnel", host)
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
 
-		go tunnelTCP(r.Context(), clientConn, hostPort, p)
+		go tunnelTCPWithConfig(r.Context(), clientConn, hostPort, p, effectiveCfg)
 
 		return
 	}
 
 	if port != "443" {
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
-		go tunnelTCP(r.Context(), clientConn, hostPort, p)
+		go tunnelTCPWithConfig(r.Context(), clientConn, hostPort, p, effectiveCfg)
 
 		return
 	}
 
-	if !p.cfg().EnableMITM {
+	if !effectiveCfg.EnableMITM {
 		p.logVerbose("MITM disabled, using plain tunnel for %s", hostPort)
 		p.publishTunnelOpened(hostPort, "connect", r.RemoteAddr, proxyUser)
 
-		go tunnelTCP(r.Context(), clientConn, hostPort, p)
+		go tunnelTCPWithConfig(r.Context(), clientConn, hostPort, p, effectiveCfg)
 
 		return
 	}
@@ -145,8 +151,8 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 
 	tlsConn := tls.Server(clientConn, &tls.Config{
 		Certificates: []tls.Certificate{*cert},
-		MinVersion:   p.cfg().GetTLSVersion(),
-		NextProtos:   p.cfg().TLSNextProtos,
+		MinVersion:   effectiveCfg.GetTLSVersion(),
+		NextProtos:   effectiveCfg.TLSNextProtos,
 	})
 
 	if err := tlsConn.Handshake(); err != nil {

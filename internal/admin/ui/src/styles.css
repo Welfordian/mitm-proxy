@@ -627,6 +627,74 @@ textarea {
   resize: vertical;
 }
 
+.json-editor-card {
+  display: grid;
+  gap: 8px;
+}
+
+.json-editor-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.json-editor-head h3 { margin: 0; }
+
+.json-editor {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  border: 1px solid var(--border-strong);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--bg-surface);
+}
+
+.json-editor:focus-within {
+  border-color: var(--signal-500);
+  box-shadow: var(--shadow-focus);
+}
+
+.json-editor.invalid {
+  border-color: var(--danger-border);
+}
+
+.json-editor-lines {
+  margin: 0;
+  padding: 9px 8px;
+  overflow: hidden;
+  color: var(--ink-400);
+  background: var(--ink-50);
+  border-right: 1px solid var(--border);
+  text-align: right;
+  user-select: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.json-editor textarea {
+  min-height: 220px;
+  border: 0;
+  border-radius: 0;
+  resize: vertical;
+  box-shadow: none;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre;
+  overflow: auto;
+}
+
+.json-editor textarea:focus {
+  box-shadow: none;
+}
+
+.json-editor-status {
+  min-height: 18px;
+  font-size: 12px;
+}
+
 .method-pill {
   flex: 0 0 auto;
   min-width: 48px;

@@ -37,6 +37,7 @@ type Proxy struct {
 	ws        *wsinspect.Manager
 	events    *events.Bus
 	access    *access.Controller
+	resilience ResilienceStore
 }
 
 // New creates a new Proxy instance with configured upstream transport.
@@ -118,6 +119,10 @@ func (p *Proxy) SetInterceptManager(manager *intercept.Manager) {
 
 func (p *Proxy) SetWebSocketManager(manager *wsinspect.Manager) {
 	p.ws = manager
+}
+
+func (p *Proxy) SetResilienceStore(store ResilienceStore) {
+	p.resilience = store
 }
 
 func (p *Proxy) EventBus() *events.Bus {

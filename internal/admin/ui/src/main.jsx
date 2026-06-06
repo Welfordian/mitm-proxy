@@ -33,6 +33,7 @@ const VIEWS = [
     ["Dashboard", LayoutDashboard],
     ["Intercept", Pause],
     ["Traffic", Activity],
+    ["Timeline", Activity],
     ["Repeater", Repeat],
     ["WebSockets", Server],
     ["Pentest Toolkit", Crosshair],
@@ -43,6 +44,8 @@ const VIEWS = [
   ] },
   { group: "Operate", items: [
     ["Access Control", Users],
+    ["Faults", ShieldAlert],
+    ["Host Profiles", Server],
     ["Blocks", Ban],
     ["Deployments", Server],
     ["Cache", Database],
@@ -55,6 +58,7 @@ const VIEW_SLUGS = {
   Dashboard: "",
   Intercept: "intercept",
   Traffic: "traffic",
+  Timeline: "timeline",
   Repeater: "repeater",
   WebSockets: "websockets",
   "Pentest Toolkit": "pentest-toolkit",
@@ -63,6 +67,8 @@ const VIEW_SLUGS = {
   Certificates: "certificates",
   Scopes: "scopes",
   "Access Control": "access-control",
+  Faults: "faults",
+  "Host Profiles": "host-profiles",
   Blocks: "blocks",
   Deployments: "deployments",
   Cache: "cache",
@@ -145,6 +151,12 @@ function putJSON(path, body) {
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });
+}
+
+function parseJSONEditorValue(value, fallback = {}) {
+  const text = String(value || "").trim();
+  if (!text) return fallback;
+  return JSON.parse(text);
 }
 
 function del(path) {
@@ -257,6 +269,7 @@ function App() {
     switch (current) {
       case "Intercept": return <InterceptView {...props} />;
       case "Traffic": return <TrafficView {...props} />;
+      case "Timeline": return <TimelineView {...props} />;
       case "Repeater": return <RepeaterView {...props} />;
       case "WebSockets": return <WebSocketsView {...props} />;
       case "Pentest Toolkit": return <PentestToolkitView {...props} />;
@@ -265,6 +278,8 @@ function App() {
       case "Certificates": return <CertificatesView {...props} />;
       case "Scopes": return <ScopesView {...props} setSelectedScope={setSelectedScope} />;
       case "Access Control": return <AccessControlView {...props} />;
+      case "Faults": return <FaultsView {...props} />;
+      case "Host Profiles": return <HostProfilesView {...props} />;
       case "Blocks": return <BlocksView {...props} />;
       case "Deployments": return <DeploymentsView {...props} />;
       case "Cache": return <CacheView {...props} />;
@@ -574,7 +589,7 @@ function InterceptView({ refreshKey, refresh }) {
     if (!selectedPending) return;
     setActionError("");
     try {
-      await postJSON(`/api/intercept/pending/${encodeURIComponent(selectedPending.id)}/forward`, JSON.parse(messageText || "{}"));
+      await postJSON(`/api/intercept/pending/${encodeURIComponent(selectedPending.id)}/forward`, parseJSONEditorValue(messageText, {}));
       refresh();
     } catch (err) {
       setActionError(err.message);
@@ -641,7 +656,7 @@ function InterceptView({ refreshKey, refresh }) {
           <div className="detail-topbar"><div><h2>Paused Messages</h2><p className="muted">{pending.length} recent intercepts.</p></div></div>
           <div className="split-grid">
             <div className="section-card"><h3>Queue</h3><table className="intercept-queue-table"><tbody>{pending.length ? pending.map((item) => <tr key={item.id} className={selectedPending?.id === item.id ? "selected-row" : ""} onClick={() => setSelectedPendingID(item.id)}><td><span className={`badge intercept-state ${interceptStateClass(item.state)}`}>{interceptStateLabel(item.state)}</span></td><td>{item.direction}</td><td><span className="method-pill small">{item.original?.method || item.original?.status}</span></td><td title={item.original?.host || ""}>{item.original?.host}</td></tr>) : <tr><td>No paused messages.</td></tr>}</tbody></table></div>
-            <div className="section-card"><h3>Editable Message</h3>{selectedPending ? <><textarea value={messageText} onChange={(e) => setMessageText(e.target.value)} /><div className="actions"><button className="primary" disabled={selectedPending.state !== "pending"} onClick={forward}><Play />Forward</button><button className="secondary danger-button" disabled={selectedPending.state !== "pending"} onClick={dropPending}><Trash2 />Drop</button><button className="secondary" onClick={replayPending}><Repeat />Replay</button></div>{actionError && <p className="error-text">{actionError}</p>}</> : <p className="muted">Select a message.</p>}</div>
+            <div className="section-card">{selectedPending ? <><JsonEditor title="Editable Message" value={messageText} onChange={setMessageText} minHeight={280} /><div className="actions"><button className="primary" disabled={selectedPending.state !== "pending"} onClick={forward}><Play />Forward</button><button className="secondary danger-button" disabled={selectedPending.state !== "pending"} onClick={dropPending}><Trash2 />Drop</button><button className="secondary" onClick={replayPending}><Repeat />Replay</button></div>{actionError && <p className="error-text">{actionError}</p>}</> : <p className="muted">Select a message.</p>}</div>
           </div>
         </div>
       </section>
@@ -1179,7 +1194,7 @@ function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
     method: form.method,
     url: form.url,
     timeout_ms: Number(form.timeout_ms),
-    headers: form.headersText.trim() ? JSON.parse(form.headersText) : {},
+    headers: parseJSONEditorValue(form.headersText, {}),
     body: form.body,
   });
   const save = async () => {
@@ -1221,7 +1236,7 @@ function RepeaterEditor({ detail, scopes, refresh, clearSelected }) {
           <label>Timeout ms<input type="number" value={form.timeout_ms} onChange={(e) => update("timeout_ms", e.target.value)} /></label>
         </div>
         <div className="split-grid">
-          <div className="section-card"><h3>Headers JSON</h3><textarea value={form.headersText} onChange={(e) => update("headersText", e.target.value)} /></div>
+          <JsonEditor title="Headers JSON" value={form.headersText} onChange={(value) => update("headersText", value)} />
           <div className="section-card"><h3>Request Body</h3><textarea value={form.body} onChange={(e) => update("body", e.target.value)} /></div>
         </div>
         <div className="section-card">
@@ -1600,6 +1615,317 @@ function AICopilotView({ refreshKey, refresh, selectedScope, scopes, setCurrent 
             <div className="section-card"><h3>Content</h3><AIContent content={active.content_json || {}} /></div>
           </div>
         )}
+      </section>
+    </div>
+  );
+}
+
+function TimelineView({ refreshKey, selectedScope }) {
+  const pageSize = 20;
+  const [search, setSearch] = useState("");
+  const [kind, setKind] = useState("");
+  const [host, setHost] = useState("");
+  const [live, setLive] = useState(true);
+  const [entries, setEntries] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [error, setError] = useState(null);
+  const [hasMore, setHasMore] = useState(true);
+  const loadingRef = useRef(false);
+  const requestRef = useRef(0);
+  const entriesRef = useRef([]);
+  const filterSignature = `${selectedScope}\n${search}\n${kind}\n${host}`;
+
+  useEffect(() => { entriesRef.current = entries; }, [entries]);
+
+  const timelinePath = (offset) => {
+    const params = new URLSearchParams({ limit: String(pageSize), offset: String(offset) });
+    if (search.trim()) params.set("q", search.trim());
+    if (kind) params.set("kind", kind);
+    if (host.trim()) params.set("host", host.trim());
+    if (selectedScope && selectedScope !== "all") params.set("scope_id", selectedScope);
+    return `/api/timeline?${params.toString()}`;
+  };
+
+  const mergeTimelineEntries = (current, next, prepend = false) => {
+    const seen = new Set();
+    const combined = prepend ? [...next, ...current] : [...current, ...next];
+    return combined.filter((entry) => {
+      if (!entry?.id || seen.has(entry.id)) return false;
+      seen.add(entry.id);
+      return true;
+    });
+  };
+
+  const loadTimelinePage = async (offset, replace = false) => {
+    if (loadingRef.current) return;
+    loadingRef.current = true;
+    const requestID = ++requestRef.current;
+    if (replace) setLoading(true);
+    else setLoadingMore(true);
+    setError(null);
+    try {
+      const next = await api(timelinePath(offset));
+      if (requestID !== requestRef.current) return;
+      setEntries((current) => replace ? next : mergeTimelineEntries(current, next));
+      setHasMore(next.length === pageSize);
+    } catch (err) {
+      if (requestID === requestRef.current) setError(err);
+    } finally {
+      if (requestID === requestRef.current) {
+        setLoading(false);
+        setLoadingMore(false);
+        loadingRef.current = false;
+      }
+    }
+  };
+
+  const refreshNewest = async () => {
+    const requestID = ++requestRef.current;
+    try {
+      const next = await api(timelinePath(0));
+      if (requestID !== requestRef.current) return;
+      setEntries((current) => mergeTimelineEntries(current, next, true));
+      setHasMore(next.length === pageSize || entriesRef.current.length > pageSize);
+    } catch {
+      // Keep the current timeline stable during transient live-refresh errors.
+    }
+  };
+
+  useEffect(() => {
+    requestRef.current += 1;
+    loadingRef.current = false;
+    setEntries([]);
+    setHasMore(true);
+    loadTimelinePage(0, true);
+  }, [refreshKey, filterSignature]);
+
+  useEffect(() => {
+    const page = document.querySelector(".page");
+    if (!page) return undefined;
+    const onScroll = () => {
+      if (!hasMore || loadingRef.current || loadingMore || loading) return;
+      const remaining = page.scrollHeight - page.scrollTop - page.clientHeight;
+      if (remaining < 360) loadTimelinePage(entriesRef.current.length, false);
+    };
+    page.addEventListener("scroll", onScroll, { passive: true });
+    return () => page.removeEventListener("scroll", onScroll);
+  }, [hasMore, loadingMore, loading, filterSignature]);
+
+  useEffect(() => {
+    if (!live) return undefined;
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    let timer = null;
+    const refreshSoon = () => {
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = null;
+        refreshNewest();
+      }, 500);
+    };
+    [
+      "traffic.request.started",
+      "traffic.response.completed",
+      "traffic.tunnel.opened",
+      "traffic.blocked",
+      "cache.hit",
+      "cache.miss",
+      "intercept.pending",
+      "intercept.resolved",
+      "websocket.connection",
+      "websocket.frame",
+      "fault.injected",
+      "config.updated",
+    ].forEach((topic) => source.addEventListener(topic, refreshSoon));
+    source.onerror = () => {
+      source.close();
+      setLive(false);
+    };
+    return () => {
+      source.close();
+      if (timer) clearTimeout(timer);
+    };
+  }, [live, filterSignature]);
+
+  const kinds = ["traffic", "tunnel", "cache", "blocked", "intercept", "websocket", "fault", "config", "profile"];
+  return (
+    <div className="page-stack">
+      <PageTitle title="Timeline" subtitle="Chronological request, cache, intercept, WebSocket, threat, and fault activity." actions={<button className={live ? "primary" : "secondary"} onClick={() => setLive((value) => !value)}>{live ? <Pause /> : <Play />}{live ? "Pause" : "Live"}</button>} />
+      <div className="panel">
+        <div className="settings-grid">
+          <label>Search<input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="host, URL, status, summary..." /></label>
+          <label>Kind<select value={kind} onChange={(e) => setKind(e.target.value)}><option value="">All kinds</option>{kinds.map((item) => <option key={item} value={item}>{item}</option>)}</select></label>
+          <label>Host<input value={host} onChange={(e) => setHost(e.target.value)} placeholder="api.example.test" /></label>
+        </div>
+      </div>
+      <div className="panel">
+        {error && <p className="error-text">{error.message || String(error)}</p>}
+        <table>
+          <thead><tr><th>Time</th><th>Kind</th><th>Host</th><th>Request</th><th>Status</th><th>Duration</th><th>Summary</th></tr></thead>
+          <tbody>{entries.length ? entries.map((entry) => <tr key={entry.id}>
+            <td>{timeOnly(entry.created_at)}</td>
+            <td><span className={`badge ${entry.kind}`}>{entry.kind}</span></td>
+            <td>{entry.host}</td>
+            <td><span className="method-pill small">{entry.method || "-"}</span> <span title={entry.url}>{entry.url || entry.request_id || entry.connection_id}</span></td>
+            <td>{entry.status || ""}</td>
+            <td>{entry.duration_ms ? `${entry.duration_ms} ms` : ""}</td>
+            <td>{entry.summary}{entry.severity && <span className={`badge ${entry.severity}`}>{entry.severity}</span>}</td>
+          </tr>) : <tr><td colSpan="7">{loading ? "Loading timeline..." : "No timeline entries yet."}</td></tr>}</tbody>
+        </table>
+        <div className="list-status">{loadingMore ? "Loading older entries..." : hasMore && entries.length ? "Scroll for older entries." : entries.length ? "End of timeline." : ""}</div>
+      </div>
+    </div>
+  );
+}
+
+function FaultsView({ refreshKey, refresh, selectedScope }) {
+  const emptyRule = { name: "", enabled: true, priority: 100, phase: "request", action: "delay", host_patterns: [], url_patterns: [], method_patterns: [], scope_ids: [], delay_ms: 500, throttle_bytes_per_second: 1024, corrupt_probability: 1, corrupt_mode: "flip_byte", synthetic_status: 503, synthetic_headers: { "Content-Type": ["text/plain; charset=utf-8"] }, synthetic_body: "synthetic fault response\n" };
+  const [selectedID, setSelectedID] = useState("");
+  const [form, setForm] = useState(emptyRule);
+  const [testForm, setTestForm] = useState({ phase: "request", method: "GET", url: "https://example.test/", host: "example.test", scope_id: selectedScope === "all" ? "" : selectedScope });
+  const [testResult, setTestResult] = useState(null);
+  const [headersText, setHeadersText] = useState(JSON.stringify(emptyRule.synthetic_headers, null, 2));
+  const [saveError, setSaveError] = useState("");
+  const state = useAsync(() => api("/api/faults/rules"), [refreshKey]);
+
+  useEffect(() => {
+    const rule = (state.data || []).find((item) => item.id === selectedID);
+    if (rule) {
+      setForm(rule);
+      setHeadersText(JSON.stringify(rule.synthetic_headers || {}, null, 2));
+    }
+  }, [selectedID, state.data]);
+
+  if (state.loading || state.error) return <PageState state={state} />;
+  const rules = Array.isArray(state.data) ? state.data : [];
+  const save = async () => {
+    setSaveError("");
+    try {
+      const payload = { ...form, synthetic_headers: parseJSONEditorValue(headersText, {}) };
+      if (selectedID) await putJSON(`/api/faults/rules/${encodeURIComponent(selectedID)}`, payload);
+      else {
+        const created = await postJSON("/api/faults/rules", payload);
+        setSelectedID(created.id);
+      }
+      refresh();
+    } catch (err) {
+      setSaveError(err.message);
+    }
+  };
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head"><div><h2>Faults</h2><p>HTTP latency and failure injection.</p></div><button className="secondary" onClick={() => { setSelectedID(""); setForm(emptyRule); setHeadersText(JSON.stringify(emptyRule.synthetic_headers, null, 2)); }}><Plus />New</button></div>
+        <div className="workbench-list">{rules.length ? rules.map((rule) => <button key={rule.id} className={`list-row ${rule.id === selectedID ? "active" : ""}`} onClick={() => setSelectedID(rule.id)}><div className="list-row-title"><span className={`badge ${rule.action}`}>{rule.action}</span><span>{rule.name}</span></div><div className="list-row-meta">{rule.phase} - priority {rule.priority} - {rule.enabled ? "enabled" : "disabled"}</div></button>) : <EmptyList>No fault rules yet.</EmptyList>}</div>
+      </aside>
+      <section className="workbench-main">
+        <div className="detail-shell">
+          <div className="detail-topbar"><div><h2>{selectedID ? "Edit Fault Rule" : "New Fault Rule"}</h2></div><div className="detail-actions"><button className="primary" onClick={save}><Save />Save</button>{selectedID && <button className="secondary danger-button" onClick={async () => { await del(`/api/faults/rules/${encodeURIComponent(selectedID)}`); setSelectedID(""); setForm(emptyRule); refresh(); }}><Trash2 />Delete</button>}</div></div>
+          {saveError && <p className="error-text">{saveError}</p>}
+          <div className="settings-grid">
+            <label>Name<input value={form.name || ""} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>Priority<input type="number" value={form.priority || 100} onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })} /></label>
+            <label>Phase<select value={form.phase || "request"} onChange={(e) => setForm({ ...form, phase: e.target.value })}><option value="request">request</option><option value="response">response</option></select></label>
+            <label>Action<select value={form.action || "delay"} onChange={(e) => setForm({ ...form, action: e.target.value })}><option value="delay">delay</option><option value="drop">drop</option><option value="throttle">throttle</option><option value="corrupt">corrupt</option><option value="synthetic_response">synthetic response</option></select></label>
+            <label><input type="checkbox" checked={form.enabled !== false} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> Enabled</label>
+          </div>
+          <div className="split-grid">
+            <PatternEditor title="Hosts" placeholder={"example.com\n*.example.com"} values={form.host_patterns || []} onChange={(values) => setForm({ ...form, host_patterns: values })} />
+            <PatternEditor title="URLs" placeholder={"*/api/*\n*checkout*"} values={form.url_patterns || []} onChange={(values) => setForm({ ...form, url_patterns: values })} />
+            <PatternEditor title="Methods" placeholder={"GET\nPOST"} values={form.method_patterns || []} onChange={(values) => setForm({ ...form, method_patterns: values })} />
+            <PatternEditor title="Scope IDs" placeholder={"scope-id"} values={form.scope_ids || []} onChange={(values) => setForm({ ...form, scope_ids: values })} />
+          </div>
+          <div className="settings-grid">
+            <label>Delay ms<input type="number" value={form.delay_ms || 0} onChange={(e) => setForm({ ...form, delay_ms: Number(e.target.value) })} /></label>
+            <label>Throttle B/s<input type="number" value={form.throttle_bytes_per_second || 0} onChange={(e) => setForm({ ...form, throttle_bytes_per_second: Number(e.target.value) })} /></label>
+            <label>Corrupt probability<input type="number" step="0.01" min="0" max="1" value={form.corrupt_probability ?? 1} onChange={(e) => setForm({ ...form, corrupt_probability: Number(e.target.value) })} /></label>
+            <label>Synthetic status<input type="number" value={form.synthetic_status || 503} onChange={(e) => setForm({ ...form, synthetic_status: Number(e.target.value) })} /></label>
+          </div>
+          <div className="split-grid"><JsonEditor title="Synthetic Headers JSON" value={headersText} onChange={setHeadersText} /><TextCard title="Synthetic Body" value={form.synthetic_body || ""} onChange={(value) => setForm({ ...form, synthetic_body: value })} /></div>
+        </div>
+        <div className="detail-shell">
+          <h2>Matcher Test</h2>
+          <div className="settings-grid">
+            <label>Phase<select value={testForm.phase} onChange={(e) => setTestForm({ ...testForm, phase: e.target.value })}><option value="request">request</option><option value="response">response</option></select></label>
+            <label>Method<input value={testForm.method} onChange={(e) => setTestForm({ ...testForm, method: e.target.value })} /></label>
+            <label>URL<input value={testForm.url} onChange={(e) => setTestForm({ ...testForm, url: e.target.value })} /></label>
+            <label>Host<input value={testForm.host} onChange={(e) => setTestForm({ ...testForm, host: e.target.value })} /></label>
+          </div>
+          <button className="secondary" onClick={async () => setTestResult(await postJSON("/api/faults/test", testForm))}>Test Rule</button>
+          <pre>{testResult ? JSON.stringify(testResult, null, 2) : ""}</pre>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function HostProfilesView({ refreshKey, refresh }) {
+  const emptyProfile = { name: "", enabled: true, priority: 100, host_patterns: [], url_patterns: [], method_patterns: [], overrides: {} };
+  const [selectedID, setSelectedID] = useState("");
+  const [form, setForm] = useState(emptyProfile);
+  const [overridesText, setOverridesText] = useState("{}");
+  const [testForm, setTestForm] = useState({ method: "GET", url: "https://example.test/", host: "example.test" });
+  const [testResult, setTestResult] = useState(null);
+  const [saveError, setSaveError] = useState("");
+  const state = useAsync(() => api("/api/host-profiles"), [refreshKey]);
+
+  useEffect(() => {
+    const profile = (state.data || []).find((item) => item.id === selectedID);
+    if (profile) {
+      setForm(profile);
+      setOverridesText(JSON.stringify(profile.overrides || {}, null, 2));
+    }
+  }, [selectedID, state.data]);
+
+  if (state.loading || state.error) return <PageState state={state} />;
+  const profiles = Array.isArray(state.data) ? state.data : [];
+  const save = async () => {
+    setSaveError("");
+    try {
+      const payload = { ...form, overrides: parseJSONEditorValue(overridesText, {}) };
+      if (selectedID) await putJSON(`/api/host-profiles/${encodeURIComponent(selectedID)}`, payload);
+      else {
+        const created = await postJSON("/api/host-profiles", payload);
+        setSelectedID(created.id);
+      }
+      refresh();
+    } catch (err) {
+      setSaveError(err.message);
+    }
+  };
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head"><div><h2>Host Profiles</h2><p>Per-host runtime overrides.</p></div><button className="secondary" onClick={() => { setSelectedID(""); setForm(emptyProfile); setOverridesText("{}"); }}><Plus />New</button></div>
+        <div className="workbench-list">{profiles.length ? profiles.map((profile) => <button key={profile.id} className={`list-row ${profile.id === selectedID ? "active" : ""}`} onClick={() => setSelectedID(profile.id)}><div className="list-row-title"><Server /><span>{profile.name}</span></div><div className="list-row-meta">priority {profile.priority} - {profile.enabled ? "enabled" : "disabled"}</div></button>) : <EmptyList>No host profiles yet.</EmptyList>}</div>
+      </aside>
+      <section className="workbench-main">
+        <div className="detail-shell">
+          <div className="detail-topbar"><div><h2>{selectedID ? "Edit Host Profile" : "New Host Profile"}</h2></div><div className="detail-actions"><button className="primary" onClick={save}><Save />Save</button>{selectedID && <button className="secondary danger-button" onClick={async () => { await del(`/api/host-profiles/${encodeURIComponent(selectedID)}`); setSelectedID(""); setForm(emptyProfile); refresh(); }}><Trash2 />Delete</button>}</div></div>
+          {saveError && <p className="error-text">{saveError}</p>}
+          <div className="settings-grid">
+            <label>Name<input value={form.name || ""} onChange={(e) => setForm({ ...form, name: e.target.value })} /></label>
+            <label>Priority<input type="number" value={form.priority || 100} onChange={(e) => setForm({ ...form, priority: Number(e.target.value) })} /></label>
+            <label><input type="checkbox" checked={form.enabled !== false} onChange={(e) => setForm({ ...form, enabled: e.target.checked })} /> Enabled</label>
+          </div>
+          <div className="split-grid">
+            <PatternEditor title="Hosts" placeholder={"example.com\n*.example.com"} values={form.host_patterns || []} onChange={(values) => setForm({ ...form, host_patterns: values })} />
+            <PatternEditor title="URLs" placeholder={"*/api/*"} values={form.url_patterns || []} onChange={(values) => setForm({ ...form, url_patterns: values })} />
+            <PatternEditor title="Methods" placeholder={"GET\nPOST"} values={form.method_patterns || []} onChange={(values) => setForm({ ...form, method_patterns: values })} />
+            <JsonEditor title="Overrides JSON" value={overridesText} onChange={setOverridesText} minHeight={280} />
+          </div>
+          <p className="muted">Example overrides: {"{\"enable_mitm\":false,\"enable_faults\":false,\"verbose_logging\":true,\"blocked_domains\":[\"*.tracking.test\"]}"}</p>
+        </div>
+        <div className="detail-shell">
+          <h2>Matcher Test</h2>
+          <div className="settings-grid">
+            <label>Method<input value={testForm.method} onChange={(e) => setTestForm({ ...testForm, method: e.target.value })} /></label>
+            <label>URL<input value={testForm.url} onChange={(e) => setTestForm({ ...testForm, url: e.target.value })} /></label>
+            <label>Host<input value={testForm.host} onChange={(e) => setTestForm({ ...testForm, host: e.target.value })} /></label>
+          </div>
+          <button className="secondary" onClick={async () => setTestResult(await postJSON("/api/host-profiles/test", testForm))}>Test Profile</button>
+          <pre>{testResult ? JSON.stringify(testResult, null, 2) : ""}</pre>
+        </div>
       </section>
     </div>
   );
@@ -2134,7 +2460,180 @@ function CodeCard({ title, value }) {
   return <div className="section-card"><h3>{title}</h3><pre>{JSON.stringify(value, null, 2)}</pre></div>;
 }
 
-function TextCard({ title, value }) {
+function JsonEditor({ title, value, onChange, minHeight = 220 }) {
+  const [error, setError] = useState("");
+  const textareaRef = useRef(null);
+  const lines = String(value || "").split("\n").length;
+  const lineNumbers = Array.from({ length: Math.max(lines, 1) }, (_, index) => index + 1).join("\n");
+  const update = (next) => {
+    onChange(next);
+    try {
+      parseJSONEditorValue(next, {});
+      setError("");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+  const setValueAndSelection = (next, start, end = start) => {
+    update(next);
+    requestAnimationFrame(() => {
+      const textarea = textareaRef.current;
+      if (!textarea) return;
+      textarea.selectionStart = start;
+      textarea.selectionEnd = end;
+    });
+  };
+  const insertAroundSelection = (open, close = open) => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const text = String(value || "");
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    const selected = text.slice(start, end);
+    if (!selected && text[start] === close) {
+      textarea.selectionStart = start + 1;
+      textarea.selectionEnd = start + 1;
+      return;
+    }
+    const next = text.slice(0, start) + open + selected + close + text.slice(end);
+    if (selected) setValueAndSelection(next, start + 1, end + 1);
+    else setValueAndSelection(next, start + 1);
+  };
+  const handleKeyDown = (event) => {
+    const textarea = textareaRef.current;
+    if (!textarea) return;
+    const text = String(value || "");
+    const start = textarea.selectionStart;
+    const end = textarea.selectionEnd;
+    if (event.key === "Tab") {
+      event.preventDefault();
+      const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+      const selectionEndLineBreak = text.indexOf("\n", end);
+      const blockEnd = selectionEndLineBreak === -1 ? text.length : selectionEndLineBreak;
+      const hasMultiLineSelection = text.slice(start, end).includes("\n");
+      if (!hasMultiLineSelection) {
+        if (event.shiftKey) {
+          if (text.slice(lineStart, lineStart + 2) === "  ") {
+            setValueAndSelection(text.slice(0, lineStart) + text.slice(lineStart + 2), Math.max(lineStart, start - 2), Math.max(lineStart, end - 2));
+          }
+          return;
+        }
+        setValueAndSelection(text.slice(0, start) + "  " + text.slice(end), start + 2);
+        return;
+      }
+      const before = text.slice(0, lineStart);
+      const block = text.slice(lineStart, blockEnd);
+      const after = text.slice(blockEnd);
+      const linesInBlock = block.split("\n");
+      let deltaStart = 0;
+      let deltaEnd = 0;
+      const nextLines = linesInBlock.map((line, index) => {
+        if (event.shiftKey) {
+          if (line.startsWith("  ")) {
+            if (index === 0 && start >= lineStart + 2) deltaStart -= 2;
+            deltaEnd -= 2;
+            return line.slice(2);
+          }
+          return line;
+        }
+        if (index === 0) deltaStart += 2;
+        deltaEnd += 2;
+        return "  " + line;
+      });
+      setValueAndSelection(before + nextLines.join("\n") + after, start + deltaStart, end + deltaEnd);
+      return;
+    }
+    if (event.key === "Enter") {
+      event.preventDefault();
+      const lineStart = text.lastIndexOf("\n", start - 1) + 1;
+      const currentLine = text.slice(lineStart, start);
+      const baseIndent = currentLine.match(/^\s*/)?.[0] || "";
+      const extraIndent = /[\{\[]\s*$/.test(currentLine) ? "  " : "";
+      const nextChar = text[end] || "";
+      if ((nextChar === "}" || nextChar === "]") && extraIndent) {
+        const insert = "\n" + baseIndent + extraIndent + "\n" + baseIndent;
+        setValueAndSelection(text.slice(0, start) + insert + text.slice(end), start + baseIndent.length + extraIndent.length + 1);
+        return;
+      }
+      const insert = "\n" + baseIndent + extraIndent;
+      setValueAndSelection(text.slice(0, start) + insert + text.slice(end), start + insert.length);
+      return;
+    }
+    if ((event.key === "\"" || event.key === "'") && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      insertAroundSelection("\"", "\"");
+      return;
+    }
+    const pairs = { "{": "}", "[": "]", "(": ")" };
+    if (pairs[event.key] && !event.metaKey && !event.ctrlKey && !event.altKey) {
+      event.preventDefault();
+      insertAroundSelection(event.key, pairs[event.key]);
+      return;
+    }
+    if ((event.key === "}" || event.key === "]" || event.key === ")") && text[start] === event.key && start === end) {
+      event.preventDefault();
+      textarea.selectionStart = start + 1;
+      textarea.selectionEnd = start + 1;
+      return;
+    }
+    if (event.key === "Backspace" && start === end && start > 0) {
+      const prev = text[start - 1];
+      const next = text[start];
+      if ((prev === "\"" && next === "\"") || (prev === "{" && next === "}") || (prev === "[" && next === "]") || (prev === "(" && next === ")")) {
+        event.preventDefault();
+        setValueAndSelection(text.slice(0, start - 1) + text.slice(start + 1), start - 1);
+      }
+    }
+  };
+  const format = () => {
+    try {
+      const parsed = parseJSONEditorValue(value, {});
+      const next = JSON.stringify(parsed, null, 2);
+      onChange(next);
+      setError("");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+  const compact = () => {
+    try {
+      const parsed = parseJSONEditorValue(value, {});
+      const next = JSON.stringify(parsed);
+      onChange(next);
+      setError("");
+    } catch (err) {
+      setError(err.message);
+    }
+  };
+  return (
+    <div className="section-card json-editor-card">
+      <div className="json-editor-head">
+        <h3>{title}</h3>
+        <div className="actions">
+          <button className="rowbutton" type="button" onClick={format}>Format</button>
+          <button className="rowbutton" type="button" onClick={compact}>Compact</button>
+        </div>
+      </div>
+      <div className={`json-editor ${error ? "invalid" : ""}`} style={{ minHeight }}>
+        <pre className="json-editor-lines" aria-hidden="true">{lineNumbers}</pre>
+        <textarea
+          ref={textareaRef}
+          spellCheck="false"
+          value={value || ""}
+          onChange={(e) => update(e.target.value)}
+          onKeyDown={handleKeyDown}
+          style={{ minHeight }}
+        />
+      </div>
+      <div className={`json-editor-status ${error ? "error-text" : "muted"}`}>{error || "Valid JSON"}</div>
+    </div>
+  );
+}
+
+function TextCard({ title, value, onChange }) {
+  if (onChange) {
+    return <div className="section-card"><h3>{title}</h3><textarea value={value || ""} onChange={(e) => onChange(e.target.value)} /></div>;
+  }
   return <div className="section-card"><h3>{title}</h3>{value ? <pre>{value}</pre> : <div className="empty-sample">No body sample captured.</div>}</div>;
 }
 

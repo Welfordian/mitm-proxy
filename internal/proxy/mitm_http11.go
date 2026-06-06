@@ -76,8 +76,19 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 
 		stripHopByHopHeaders(req.Header)
 		p.publishTrafficStarted(requestID, req, "https/1.1")
+		effectiveCfg := p.effectiveConfigForRequest(req)
 
-		if decision := p.checkPolicy(req.URL.Host); decision.Blocked {
+		if result := p.applyRequestFault(req.Context(), req, requestID); result.Handled {
+			if result.Rule.Action == "drop" {
+				p.publishBlocked(requestID, req, result.Rule.ID, "dropped by fault injection")
+			}
+			out := syntheticHTTPResponse(result)
+			_ = out.Write(clientTLS)
+			p.publishTrafficCompleted(requestID, req, out.StatusCode, len(result.Body), time.Since(start), false, out.Header)
+			continue
+		}
+
+		if decision := p.checkPolicyWithConfig(effectiveCfg, req.URL.Host); decision.Blocked {
 			p.publishBlocked(requestID, req, decision.RuleID, decision.Reason)
 			blocked := threatBlockedResponse(threatsFromPolicy(decision))
 			_ = blocked.Write(clientTLS)
@@ -108,6 +119,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			if cr, hashHex, err := p.cache.LoadContext(req.Context(), req.URL); err == nil && cr != nil {
 				p.publish(events.TopicCacheHit, map[string]any{"url": req.URL.String(), "cache_key": hashHex}, requestID)
 				cachedResp := &http.Response{StatusCode: cr.Status, Header: cr.Header.Clone()}
+				cr.Body = p.applyBufferedResponseFault(req.Context(), req, cachedResp, cr.Body, requestID)
 				verdict, scanErr := p.scanBufferedResponse(req.Context(), req, cachedResp, cr.Body)
 				if p.shouldBlock(verdict, scanErr) {
 					blocked := threatBlockedResponse(verdict)
@@ -154,7 +166,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			p.publish(events.TopicCacheMiss, map[string]any{"url": req.URL.String()}, requestID)
 		}
 
-		resp, err := p.httpClient().Do(req)
+		resp, err := p.httpClientForConfig(effectiveCfg).Do(req)
 
 		if err != nil {
 			log.Printf("upstream HTTPS/1.1 error: %v", err)
@@ -168,6 +180,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			body, _ := io.ReadAll(resp.Body)
 			resp.Body.Close()
 			stripHopByHopHeaders(resp.Header)
+			body = p.applyBufferedResponseFault(req.Context(), req, resp, body, requestID)
 
 			verdict, scanErr := p.scanBufferedResponse(req.Context(), req, resp, body)
 			if p.shouldBlock(verdict, scanErr) {
@@ -212,6 +225,7 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 				_ = blocked.Write(clientTLS)
 				continue
 			}
+			p.wrapStreamingResponseFault(req.Context(), req, resp, requestID)
 			dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
 			if err != nil {
 				resp.Body.Close()
