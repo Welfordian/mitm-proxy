@@ -17,8 +17,10 @@ import (
 	cachepkg "mitm-proxy/internal/cache"
 	cfgpkg "mitm-proxy/internal/config"
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/intercept"
 	"mitm-proxy/internal/threats"
 	"mitm-proxy/internal/upstream"
+	"mitm-proxy/internal/wsinspect"
 )
 
 // Proxy is the core HTTP handler implementing MITM and tunneling.
@@ -31,6 +33,8 @@ type Proxy struct {
 	certCache map[string]*tls.Certificate
 	cache     *cachepkg.Cache
 	threats   *threats.Manager
+	intercept *intercept.Manager
+	ws        *wsinspect.Manager
 	events    *events.Bus
 	access    *access.Controller
 }
@@ -106,6 +110,14 @@ func (p *Proxy) accessController() *access.Controller {
 
 func (p *Proxy) ThreatScanner() *threats.Manager {
 	return p.threats
+}
+
+func (p *Proxy) SetInterceptManager(manager *intercept.Manager) {
+	p.intercept = manager
+}
+
+func (p *Proxy) SetWebSocketManager(manager *wsinspect.Manager) {
+	p.ws = manager
 }
 
 func (p *Proxy) EventBus() *events.Bus {

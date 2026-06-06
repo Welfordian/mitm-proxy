@@ -109,6 +109,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, threatsFromPolicy(decision))
 		return
 	}
+	dropped, err := p.interceptRequest(req.Context(), req, requestID)
+	if err != nil {
+		http.Error(w, "intercept error", http.StatusBadGateway)
+		return
+	}
+	if dropped {
+		http.Error(w, "dropped by intercept", http.StatusForbidden)
+		return
+	}
 
 	verdict, scanErr := p.scanRequest(req.Context(), req)
 	if p.shouldBlock(verdict, scanErr) {
@@ -127,8 +136,18 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 				writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 				return
 			}
+			body := cr.Body
+			body, dropped, err = p.interceptBufferedResponse(req.Context(), req, cachedResp, body, requestID)
+			if err != nil {
+				http.Error(w, "intercept error", http.StatusBadGateway)
+				return
+			}
+			if dropped {
+				http.Error(w, "dropped by intercept", http.StatusForbidden)
+				return
+			}
 
-			for k, vals := range cr.Header {
+			for k, vals := range cachedResp.Header {
 				for _, v := range vals {
 					w.Header().Add(k, v)
 				}
@@ -141,12 +160,12 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			uidHeader := p.makeCustomHeader("uid")
 
 			w.Header().Set(uidHeader, hashHex)
-			w.WriteHeader(cr.Status)
-			n, _ := w.Write(cr.Body)
+			w.WriteHeader(cachedResp.StatusCode)
+			n, _ := w.Write(body)
 			dur := time.Since(start)
 
 			p.logRequest("CACHE HIT HTTP %s %s -> status=%d, bytes=%d, dur=%s", r.Method, req.URL.String(), cr.Status, n, dur)
-			p.publishTrafficCompleted(requestID, req, cr.Status, n, dur, true, cr.Header)
+			p.publishTrafficCompleted(requestID, req, cachedResp.StatusCode, n, dur, true, cachedResp.Header)
 
 			return
 		}
@@ -176,6 +195,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 			return
 		}
+		bodyBuf, dropped, err = p.interceptBufferedResponse(req.Context(), req, resp, bodyBuf, requestID)
+		if err != nil {
+			http.Error(w, "intercept error", http.StatusBadGateway)
+			return
+		}
+		if dropped {
+			http.Error(w, "dropped by intercept", http.StatusForbidden)
+			return
+		}
 
 		for k, vals := range resp.Header {
 			for _, v := range vals {
@@ -198,6 +226,15 @@ func (p *Proxy) handleHTTP(w http.ResponseWriter, r *http.Request) {
 	verdict, scanErr = p.prepareResponseForScan(req.Context(), req, resp)
 	if p.shouldBlock(verdict, scanErr) {
 		writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
+		return
+	}
+	dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
+	if err != nil {
+		http.Error(w, "intercept error", http.StatusBadGateway)
+		return
+	}
+	if dropped {
+		http.Error(w, "dropped by intercept", http.StatusForbidden)
 		return
 	}
 
@@ -244,6 +281,7 @@ func (p *Proxy) handleWebSocketHTTP(w http.ResponseWriter, r *http.Request) {
 		targetHost = net.JoinHostPort(targetHost, "80")
 	}
 	r.Header.Del("Proxy-Authorization")
+	stripWebSocketCompression(r.Header)
 
 	upstreamConn, err := upstream.DialContext(r.Context(), p.cfg(), targetHost)
 
@@ -299,18 +337,9 @@ func (p *Proxy) handleWebSocketHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	p.logVerbose("ws tunnel established %s <-> %s", clientConn.RemoteAddr(), targetHost)
-
-	go func() {
-		defer clientConn.Close()
-		defer upstreamConn.Close()
-
-		io.Copy(upstreamConn, clientConn)
-	}()
-
-	go func() {
-		defer clientConn.Close()
-		defer upstreamConn.Close()
-
-		io.Copy(clientConn, upstreamConn)
-	}()
+	rawURL := r.URL.String()
+	if rawURL == "" {
+		rawURL = "ws://" + targetHost + r.URL.RequestURI()
+	}
+	p.startWebSocketInspection(r.Context(), requestID(time.Now()), rawURL, targetHost, "ws", r.RemoteAddr, access.Username(r.Context()), clientConn, upstreamConn, upstreamReader)
 }

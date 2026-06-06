@@ -11,6 +11,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
@@ -31,11 +32,13 @@ import (
 	"mitm-proxy/internal/copilot"
 	"mitm-proxy/internal/deployments"
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/intercept"
 	"mitm-proxy/internal/pentest"
 	"mitm-proxy/internal/policy"
 	"mitm-proxy/internal/store"
 	"mitm-proxy/internal/threats"
 	"mitm-proxy/internal/upstream"
+	"mitm-proxy/internal/wsinspect"
 )
 
 type Options struct {
@@ -50,6 +53,8 @@ type Options struct {
 	ProxyStarted  time.Time
 	GeneratedAuth bool
 	ThreatScanner *threats.Manager
+	Intercept     *intercept.Manager
+	WebSockets    *wsinspect.Manager
 	CopilotClient copilot.Client
 	EventBus      *events.Bus
 	SaveConfig    func(context.Context, *cfgpkg.Config) error
@@ -99,6 +104,12 @@ func New(options Options) *Server {
 	apiMux.HandleFunc("/api/traffic/stream", s.handleTrafficStream)
 	apiMux.HandleFunc("/api/repeater/cases", s.handleRepeaterCases)
 	apiMux.HandleFunc("/api/repeater/cases/", s.handleRepeaterCaseDetail)
+	apiMux.HandleFunc("/api/intercept/rules", s.handleInterceptRules)
+	apiMux.HandleFunc("/api/intercept/rules/", s.handleInterceptRuleDetail)
+	apiMux.HandleFunc("/api/intercept/pending", s.handleInterceptPending)
+	apiMux.HandleFunc("/api/intercept/pending/", s.handleInterceptPendingDetail)
+	apiMux.HandleFunc("/api/websockets/connections", s.handleWebSocketConnections)
+	apiMux.HandleFunc("/api/websockets/connections/", s.handleWebSocketConnectionDetail)
 	apiMux.HandleFunc("/api/ai/traffic/", s.handleAITraffic)
 	apiMux.HandleFunc("/api/ai/repeater/cases/", s.handleAIRepeater)
 	apiMux.HandleFunc("/api/ai/notes", s.handleAINotes)
@@ -275,8 +286,13 @@ func (s *Server) handleTraffic(w http.ResponseWriter, r *http.Request) {
 	if s.options.Store != nil {
 		scopeID, includeOutOfScope := scopeFilter(r)
 		limit, offset := paginationParams(r, 200)
-		flows, err := s.options.Store.ListTrafficScopedPage(r.Context(), limit, offset, scopeID, includeOutOfScope, r.URL.Query().Get("q"))
+		flows, err := s.options.Store.ListTrafficAdvanced(r.Context(), limit, offset, scopeID, includeOutOfScope, r.URL.Query().Get("q"))
 		if err != nil {
+			var queryErr store.TrafficQueryError
+			if errors.As(err, &queryErr) {
+				writeJSON(w, http.StatusBadRequest, queryErr)
+				return
+			}
 			http.Error(w, err.Error(), http.StatusInternalServerError)
 			return
 		}
@@ -858,6 +874,352 @@ func (s *Server) handleRepeaterSend(w http.ResponseWriter, r *http.Request, id s
 	decodeRepeaterRunForDisplay(&stored)
 	s.audit(r, "repeater.case.send", map[string]any{"id": id, "run_id": stored.ID, "status": stored.Status, "error": stored.Error})
 	writeJSON(w, http.StatusOK, stored)
+}
+
+func (s *Server) handleInterceptRules(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		rules, err := s.options.Store.ListInterceptRules(r.Context())
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, rules)
+	case http.MethodPost:
+		rule, ok := decodeInterceptRule(w, r)
+		if !ok {
+			return
+		}
+		created, err := s.options.Store.CreateInterceptRule(r.Context(), rule)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "intercept.rule.create", map[string]any{"id": created.ID})
+		writeJSON(w, http.StatusCreated, created)
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func (s *Server) handleInterceptRuleDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/api/intercept/rules/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	switch r.Method {
+	case http.MethodPut:
+		rule, ok := decodeInterceptRule(w, r)
+		if !ok {
+			return
+		}
+		rule.ID = id
+		updated, err := s.options.Store.UpdateInterceptRule(r.Context(), rule)
+		if errors.Is(err, sql.ErrNoRows) {
+			http.NotFound(w, r)
+			return
+		}
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "intercept.rule.update", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, updated)
+	case http.MethodDelete:
+		if err := s.options.Store.DeleteInterceptRule(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "intercept.rule.delete", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+	default:
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+	}
+}
+
+func decodeInterceptRule(w http.ResponseWriter, r *http.Request) (store.InterceptRule, bool) {
+	var rule store.InterceptRule
+	if err := json.NewDecoder(r.Body).Decode(&rule); err != nil {
+		http.Error(w, "invalid JSON body", http.StatusBadRequest)
+		return store.InterceptRule{}, false
+	}
+	return rule, true
+}
+
+func (s *Server) handleInterceptPending(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	state := strings.TrimSpace(r.URL.Query().Get("state"))
+	limit, _ := paginationParams(r, 100)
+	items, err := s.options.Store.ListPendingIntercepts(r.Context(), state, limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, items)
+}
+
+func (s *Server) handleInterceptPendingDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/intercept/pending/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[0]
+	if r.Method == http.MethodGet && len(parts) == 1 {
+		pending, ok, err := s.options.Store.GetPendingIntercept(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, pending)
+		return
+	}
+	if r.Method != http.MethodPost || len(parts) != 2 {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	switch parts[1] {
+	case "forward":
+		var input store.InterceptMessage
+		_ = json.NewDecoder(r.Body).Decode(&input)
+		if s.options.Intercept == nil {
+			http.Error(w, "intercept manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		pending, ok, err := s.options.Intercept.Forward(r.Context(), id, input)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		s.audit(r, "intercept.forward", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, pending)
+	case "drop":
+		if s.options.Intercept == nil {
+			http.Error(w, "intercept manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		pending, ok, err := s.options.Intercept.Drop(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		s.audit(r, "intercept.drop", map[string]any{"id": id})
+		writeJSON(w, http.StatusOK, pending)
+	case "replay":
+		pending, ok, err := s.options.Store.GetPendingIntercept(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		msg := pending.Edited
+		if msg.URL == "" {
+			msg = pending.Original
+		}
+		c, err := s.options.Store.CreateRepeaterCase(r.Context(), store.RepeaterCase{
+			SourceFlowID: pending.RequestID,
+			Name:         "Intercept " + pending.Direction,
+			Method:       fallbackString(msg.Method, "GET"),
+			URL:          msg.URL,
+			Headers:      msg.Headers,
+			Body:         msg.Body,
+			TimeoutMS:    repeaterTimeoutMS,
+			ScopeID:      msg.ScopeID,
+		})
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		s.audit(r, "intercept.replay", map[string]any{"id": id, "case_id": c.ID})
+		writeJSON(w, http.StatusCreated, c)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func fallbackString(value, fallback string) string {
+	if strings.TrimSpace(value) == "" {
+		return fallback
+	}
+	return value
+}
+
+func (s *Server) handleWebSocketConnections(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	limit, _ := paginationParams(r, 100)
+	conns, err := s.options.Store.ListWebSocketConnections(r.Context(), limit)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSON(w, http.StatusOK, conns)
+}
+
+func (s *Server) handleWebSocketConnectionDetail(w http.ResponseWriter, r *http.Request) {
+	if s.options.Store == nil {
+		s.handleNotImplemented(w, r)
+		return
+	}
+	path := strings.TrimPrefix(r.URL.Path, "/api/websockets/connections/")
+	parts := strings.Split(strings.Trim(path, "/"), "/")
+	if len(parts) == 0 || parts[0] == "" {
+		http.NotFound(w, r)
+		return
+	}
+	id := parts[0]
+	if len(parts) == 1 && r.Method == http.MethodGet {
+		conn, ok, err := s.options.Store.GetWebSocketConnection(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		writeJSON(w, http.StatusOK, conn)
+		return
+	}
+	if len(parts) != 2 {
+		http.NotFound(w, r)
+		return
+	}
+	switch parts[1] {
+	case "frames":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		limit, offset := paginationParams(r, 200)
+		frames, err := s.options.Store.ListWebSocketFrames(r.Context(), id, limit, offset, r.URL.Query().Get("q"))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeJSON(w, http.StatusOK, frames)
+	case "export":
+		if r.Method != http.MethodGet {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		conn, ok, err := s.options.Store.GetWebSocketConnection(r.Context(), id)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		if !ok {
+			http.NotFound(w, r)
+			return
+		}
+		frames, err := s.options.Store.ListWebSocketFrames(r.Context(), id, 1000, 0, "")
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusInternalServerError)
+			return
+		}
+		writeDownloadJSON(w, http.StatusOK, "websocket-"+id+".json", map[string]any{"connection": conn, "frames": frames})
+	case "send":
+		if r.Method != http.MethodPost {
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		if s.options.WebSockets == nil {
+			http.Error(w, "websocket manager unavailable", http.StatusServiceUnavailable)
+			return
+		}
+		var input struct {
+			Direction string `json:"direction"`
+			Opcode    int    `json:"opcode"`
+			Payload   string `json:"payload"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+			http.Error(w, "invalid JSON body", http.StatusBadRequest)
+			return
+		}
+		if input.Direction == "" {
+			input.Direction = "client_to_server"
+		}
+		if input.Opcode == 0 {
+			input.Opcode = 1
+		}
+		frame, err := s.options.WebSockets.Send(r.Context(), id, input.Direction, input.Opcode, []byte(input.Payload))
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		s.audit(r, "websocket.send", map[string]any{"connection_id": id, "opcode": input.Opcode, "direction": input.Direction})
+		s.publishWebSocketFrame(frame)
+		writeJSON(w, http.StatusOK, frame)
+	default:
+		http.NotFound(w, r)
+	}
+}
+
+func (s *Server) publishWebSocketFrame(frame store.WebSocketFrame) {
+	if s.options.PublishEvent == nil {
+		return
+	}
+	s.options.PublishEvent(events.Event{
+		Topic: events.TopicWebSocketFrame,
+		Time:  time.Now().UTC(),
+		Payload: map[string]any{
+			"connection_id": frame.ConnectionID,
+			"frame": map[string]any{
+				"id":            frame.ID,
+				"connection_id": frame.ConnectionID,
+				"created_at":    frame.CreatedAt,
+				"direction":     frame.Direction,
+				"opcode":        frame.Opcode,
+				"opcode_name":   frame.OpcodeName,
+				"payload":       frame.Payload,
+				"payload_bytes": frame.PayloadBytes,
+				"truncated":     frame.Truncated,
+				"injected":      frame.Injected,
+			},
+		},
+	})
 }
 
 func (s *Server) handleAITraffic(w http.ResponseWriter, r *http.Request) {
@@ -2082,6 +2444,11 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				RequireAuthForLoopback *bool  `json:"require_auth_for_loopback"`
 				DefaultAction          string `json:"default_action"`
 			} `json:"proxy_auth"`
+			Intercept *struct {
+				Enabled       *bool  `json:"enabled"`
+				TimeoutMS     *int   `json:"timeout_ms"`
+				TimeoutAction string `json:"timeout_action"`
+			} `json:"intercept"`
 			Cache *struct {
 				Enabled           *bool    `json:"enabled"`
 				Directory         string   `json:"directory"`
@@ -2195,6 +2562,17 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				cfg.ProxyAuth.DefaultAction = input.ProxyAuth.DefaultAction
 			}
 		}
+		if input.Intercept != nil {
+			if input.Intercept.Enabled != nil {
+				cfg.Intercept.Enabled = *input.Intercept.Enabled
+			}
+			if input.Intercept.TimeoutMS != nil {
+				cfg.Intercept.TimeoutMS = *input.Intercept.TimeoutMS
+			}
+			if input.Intercept.TimeoutAction != "" {
+				cfg.Intercept.TimeoutAction = input.Intercept.TimeoutAction
+			}
+		}
 		if input.Cache != nil {
 			if input.Cache.Enabled != nil {
 				cfg.Cache.Enabled = *input.Cache.Enabled
@@ -2223,6 +2601,10 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if err := cfg.ValidateProxyAuth(); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		if err := cfg.ValidateIntercept(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -2628,6 +3010,7 @@ func safeSettings(cfg *cfgpkg.Config) map[string]any {
 		"ai_copilot":           cfg.AICopilot,
 		"upstream_proxy":       safeUpstreamProxySettings(cfg.UpstreamProxy),
 		"proxy_auth":           cfg.ProxyAuth,
+		"intercept":            cfg.Intercept,
 	}
 }
 

@@ -31,8 +31,10 @@ import "./styles.css";
 const VIEWS = [
   { group: "Inspect", items: [
     ["Dashboard", LayoutDashboard],
+    ["Intercept", Pause],
     ["Traffic", Activity],
     ["Repeater", Repeat],
+    ["WebSockets", Server],
     ["Pentest Toolkit", Crosshair],
     ["AI Copilot", Bot],
     ["Threat Scanner", ShieldAlert],
@@ -51,8 +53,10 @@ const VIEWS = [
 
 const VIEW_SLUGS = {
   Dashboard: "",
+  Intercept: "intercept",
   Traffic: "traffic",
   Repeater: "repeater",
+  WebSockets: "websockets",
   "Pentest Toolkit": "pentest-toolkit",
   "AI Copilot": "ai-copilot",
   "Threat Scanner": "threat-scanner",
@@ -197,6 +201,22 @@ function useAsync(factory, deps) {
   return state;
 }
 
+function useAsyncStale(factory, deps, initialData = null, resetKey = "") {
+  const [state, setState] = useState({ loading: true, data: initialData, error: null });
+  const resetKeyRef = useRef(resetKey);
+  useEffect(() => {
+    let cancelled = false;
+    const shouldReset = resetKeyRef.current !== resetKey;
+    resetKeyRef.current = resetKey;
+    setState((prev) => shouldReset ? { loading: true, data: initialData, error: null } : { ...prev, loading: true, error: null });
+    factory()
+      .then((data) => !cancelled && setState({ loading: false, data, error: null }))
+      .catch((error) => !cancelled && setState((prev) => ({ ...prev, loading: false, error })));
+    return () => { cancelled = true; };
+  }, deps);
+  return state;
+}
+
 function App() {
   const [current, setCurrent] = useState(currentViewFromURL);
   const [refreshKey, setRefreshKey] = useState(0);
@@ -235,8 +255,10 @@ function App() {
   const body = useMemo(() => {
     const props = { refreshKey, refresh, setCurrent, selectedScope, scopes };
     switch (current) {
+      case "Intercept": return <InterceptView {...props} />;
       case "Traffic": return <TrafficView {...props} />;
       case "Repeater": return <RepeaterView {...props} />;
+      case "WebSockets": return <WebSocketsView {...props} />;
       case "Pentest Toolkit": return <PentestToolkitView {...props} />;
       case "AI Copilot": return <AICopilotView {...props} />;
       case "Threat Scanner": return <ThreatScannerView {...props} />;
@@ -448,6 +470,309 @@ function formatDuration(totalSeconds) {
   return `${String(hours).padStart(2, "0")}:${String(minutes).padStart(2, "0")}`;
 }
 
+function interceptStateLabel(state) {
+  return String(state || "pending").replace(/_/g, " ");
+}
+
+function interceptStateClass(state) {
+  switch (state) {
+    case "pending": return "warn";
+    case "forwarded": return "allow";
+    case "dropped": return "block";
+    case "timed_out": return "timeout";
+    default: return "";
+  }
+}
+
+function normalizeWebSocketFrame(frame) {
+  if (!frame || !frame.connection_id) return null;
+  return {
+    ...frame,
+    id: frame.id || `${frame.connection_id}-${frame.created_at || Date.now()}-${frame.direction || ""}-${frame.payload_bytes || 0}`,
+    opcode_name: frame.opcode_name || String(frame.opcode || ""),
+    payload: frame.payload || "",
+    payload_bytes: frame.payload_bytes ?? frame.bytes ?? 0,
+  };
+}
+
+function frameMatchesSearch(frame, search) {
+  const term = search.trim().toLowerCase();
+  if (!term) return true;
+  return [frame.payload, frame.opcode_name, frame.direction].some((value) => String(value || "").toLowerCase().includes(term));
+}
+
+function mergeWebSocketFrames(...groups) {
+  const seen = new Set();
+  return groups.flat().filter(Boolean).filter((frame) => {
+    if (seen.has(frame.id)) return false;
+    seen.add(frame.id);
+    return true;
+  }).sort((a, b) => {
+    const byTime = new Date(b.created_at || 0).getTime() - new Date(a.created_at || 0).getTime();
+    if (byTime) return byTime;
+    return String(b.id || "").localeCompare(String(a.id || ""));
+  });
+}
+
+function InterceptView({ refreshKey, refresh }) {
+  const state = useAsync(async () => {
+    const [rules, pending, settings] = await Promise.all([
+      api("/api/intercept/rules"),
+      api("/api/intercept/pending?limit=100"),
+      api("/api/settings"),
+    ]);
+    return { rules, pending, settings };
+  }, [refreshKey]);
+  const emptyRule = { name: "", enabled: true, priority: 100, direction: "request", host_patterns: [], method_patterns: [], status_patterns: [], scope_ids: [], content_type_patterns: [] };
+  const [selectedRuleID, setSelectedRuleID] = useState(sessionStorage.getItem("selectedInterceptRule") || "");
+  const [ruleForm, setRuleForm] = useState(emptyRule);
+  const [selectedPendingID, setSelectedPendingID] = useState("");
+  const [messageText, setMessageText] = useState("");
+  const [actionError, setActionError] = useState("");
+
+  useEffect(() => {
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    const reload = () => refresh();
+    source.addEventListener("intercept.pending", reload);
+    source.addEventListener("intercept.resolved", reload);
+    return () => source.close();
+  }, []);
+
+  useEffect(() => {
+    const rule = (state.data?.rules || []).find((item) => item.id === selectedRuleID);
+    if (rule) setRuleForm(rule);
+  }, [selectedRuleID, state.data]);
+
+  const selectedPending = (state.data?.pending || []).find((item) => item.id === selectedPendingID) || (state.data?.pending || [])[0];
+  useEffect(() => {
+    if (selectedPending) setMessageText(JSON.stringify(selectedPending.edited || selectedPending.original || {}, null, 2));
+  }, [selectedPending?.id]);
+
+  if (state.loading || state.error) return <PageState state={state} />;
+  const rules = Array.isArray(state.data?.rules) ? state.data.rules : [];
+  const pending = Array.isArray(state.data?.pending) ? state.data.pending : [];
+  const interceptSettings = state.data?.settings?.intercept || {};
+  const setInterceptEnabled = async (enabled) => {
+    await putJSON("/api/settings", {
+      intercept: {
+        ...interceptSettings,
+        enabled,
+      },
+    });
+    refresh();
+  };
+  const saveRule = async () => {
+    if (selectedRuleID) await putJSON(`/api/intercept/rules/${encodeURIComponent(selectedRuleID)}`, ruleForm);
+    else {
+      const created = await postJSON("/api/intercept/rules", ruleForm);
+      sessionStorage.setItem("selectedInterceptRule", created.id);
+      setSelectedRuleID(created.id);
+    }
+    refresh();
+  };
+  const forward = async () => {
+    if (!selectedPending) return;
+    setActionError("");
+    try {
+      await postJSON(`/api/intercept/pending/${encodeURIComponent(selectedPending.id)}/forward`, JSON.parse(messageText || "{}"));
+      refresh();
+    } catch (err) {
+      setActionError(err.message);
+    }
+  };
+  const dropPending = async () => {
+    if (!selectedPending) return;
+    await post(`/api/intercept/pending/${encodeURIComponent(selectedPending.id)}/drop`);
+    refresh();
+  };
+  const replayPending = async () => {
+    if (!selectedPending) return;
+    const created = await post(`/api/intercept/pending/${encodeURIComponent(selectedPending.id)}/replay`);
+    sessionStorage.setItem("selectedRepeaterCase", created.id);
+    refresh();
+  };
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head">
+          <div><h2>Intercept</h2><p>Breakpoint rules and paused HTTP messages.</p></div>
+          <button className="secondary" onClick={() => { sessionStorage.removeItem("selectedInterceptRule"); setSelectedRuleID(""); setRuleForm(emptyRule); }}><Plus />New Rule</button>
+        </div>
+        <div className="workbench-list">
+          {rules.length ? rules.map((rule) => (
+            <button key={rule.id} className={`list-row ${rule.id === selectedRuleID ? "active" : ""}`} onClick={() => { sessionStorage.setItem("selectedInterceptRule", rule.id); setSelectedRuleID(rule.id); }}>
+              <div className="list-row-title"><span className={`badge ${rule.direction}`}>{rule.direction}</span><span>{rule.name}</span></div>
+              <div className="list-row-meta">priority {rule.priority} - {rule.enabled ? "enabled" : "disabled"}</div>
+            </button>
+          )) : <EmptyList>No breakpoint rules yet.</EmptyList>}
+        </div>
+      </aside>
+      <section className="workbench-main">
+        <div className="detail-shell">
+          <div className="detail-topbar">
+            <div>
+              <h2>Breakpoint Engine</h2>
+              <p className="muted">Rules only pause traffic while breakpoints are enabled.</p>
+            </div>
+            <label className="toggle-row"><input type="checkbox" checked={!!interceptSettings.enabled} onChange={(e) => setInterceptEnabled(e.target.checked)} /> Enable breakpoints</label>
+          </div>
+          <div className="grid metrics-grid compact">
+            <Metric label="State" value={interceptSettings.enabled ? "enabled" : "disabled"} tone={interceptSettings.enabled ? "success" : ""} />
+            <Metric label="Timeout" value={`${interceptSettings.timeout_ms || 30000} ms`} />
+            <Metric label="Timeout action" value={interceptSettings.timeout_action || "forward"} />
+          </div>
+        </div>
+        <div className="detail-shell">
+          <div className="detail-topbar"><div className="detail-title"><h2>{selectedRuleID ? "Edit Rule" : "New Rule"}</h2></div><div className="detail-actions"><button className="primary" onClick={saveRule}><Save />Save</button>{selectedRuleID && <button className="secondary danger-button" onClick={async () => { await del(`/api/intercept/rules/${encodeURIComponent(selectedRuleID)}`); sessionStorage.removeItem("selectedInterceptRule"); setSelectedRuleID(""); setRuleForm(emptyRule); refresh(); }}><Trash2 />Delete</button>}</div></div>
+          <div className="settings-grid">
+            <label>Name<input value={ruleForm.name || ""} onChange={(e) => setRuleForm({ ...ruleForm, name: e.target.value })} /></label>
+            <label>Priority<input type="number" value={ruleForm.priority || 100} onChange={(e) => setRuleForm({ ...ruleForm, priority: Number(e.target.value) })} /></label>
+            <label>Direction<select value={ruleForm.direction || "request"} onChange={(e) => setRuleForm({ ...ruleForm, direction: e.target.value })}><option value="request">request</option><option value="response">response</option></select></label>
+            <label><input type="checkbox" checked={ruleForm.enabled !== false} onChange={(e) => setRuleForm({ ...ruleForm, enabled: e.target.checked })} /> Enabled</label>
+          </div>
+          <div className="split-grid">
+            <PatternEditor title="Hosts" placeholder={"example.com\n*.example.com"} values={ruleForm.host_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, host_patterns: values })} />
+            <PatternEditor title="Methods" placeholder={"GET\nPOST"} values={ruleForm.method_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, method_patterns: values })} />
+            <PatternEditor title="Statuses" placeholder={"200\n>=400"} values={ruleForm.status_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, status_patterns: values })} />
+            <PatternEditor title="Content Types" placeholder={"application/json\ntext/html"} values={ruleForm.content_type_patterns || []} onChange={(values) => setRuleForm({ ...ruleForm, content_type_patterns: values })} />
+          </div>
+        </div>
+        <div className="detail-shell">
+          <div className="detail-topbar"><div><h2>Paused Messages</h2><p className="muted">{pending.length} recent intercepts.</p></div></div>
+          <div className="split-grid">
+            <div className="section-card"><h3>Queue</h3><table className="intercept-queue-table"><tbody>{pending.length ? pending.map((item) => <tr key={item.id} className={selectedPending?.id === item.id ? "selected-row" : ""} onClick={() => setSelectedPendingID(item.id)}><td><span className={`badge intercept-state ${interceptStateClass(item.state)}`}>{interceptStateLabel(item.state)}</span></td><td>{item.direction}</td><td><span className="method-pill small">{item.original?.method || item.original?.status}</span></td><td title={item.original?.host || ""}>{item.original?.host}</td></tr>) : <tr><td>No paused messages.</td></tr>}</tbody></table></div>
+            <div className="section-card"><h3>Editable Message</h3>{selectedPending ? <><textarea value={messageText} onChange={(e) => setMessageText(e.target.value)} /><div className="actions"><button className="primary" disabled={selectedPending.state !== "pending"} onClick={forward}><Play />Forward</button><button className="secondary danger-button" disabled={selectedPending.state !== "pending"} onClick={dropPending}><Trash2 />Drop</button><button className="secondary" onClick={replayPending}><Repeat />Replay</button></div>{actionError && <p className="error-text">{actionError}</p>}</> : <p className="muted">Select a message.</p>}</div>
+          </div>
+        </div>
+      </section>
+    </div>
+  );
+}
+
+function WebSocketsView({ refreshKey, refresh }) {
+  const framePageSize = 20;
+  const [selected, setSelected] = useState("");
+  const [search, setSearch] = useState("");
+  const [connectionsLive, setConnectionsLive] = useState(false);
+  const [framesLive, setFramesLive] = useState(false);
+  const [connectionsRefreshKey, setConnectionsRefreshKey] = useState(0);
+  const [frameLimit, setFrameLimit] = useState(framePageSize);
+  const [streamedFrames, setStreamedFrames] = useState([]);
+  const connectionsTimerRef = useRef(null);
+  const framesTimerRef = useRef(null);
+  const frameBufferRef = useRef([]);
+  const [sendForm, setSendForm] = useState({ direction: "client_to_server", opcode: 1, payload: "" });
+  const state = useAsyncStale(() => api("/api/websockets/connections?limit=100"), [refreshKey, connectionsRefreshKey], [], "connections");
+  const framesState = useAsyncStale(async () => selected ? api(`/api/websockets/connections/${encodeURIComponent(selected)}/frames?limit=${frameLimit + 1}&offset=0&q=${encodeURIComponent(search)}`) : [], [selected, search, frameLimit, refreshKey], [], `${selected}\n${search}`);
+
+  useEffect(() => {
+    if (!connectionsLive) return undefined;
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    const scheduleRefresh = () => {
+      if (connectionsTimerRef.current) return;
+      connectionsTimerRef.current = setTimeout(() => {
+        connectionsTimerRef.current = null;
+        setConnectionsRefreshKey((value) => value + 1);
+      }, 500);
+    };
+    source.addEventListener("websocket.connection", scheduleRefresh);
+    source.addEventListener("websocket.frame", scheduleRefresh);
+    source.onerror = () => {
+      source.close();
+      setConnectionsLive(false);
+    };
+    return () => {
+      source.close();
+      if (connectionsTimerRef.current) {
+        clearTimeout(connectionsTimerRef.current);
+        connectionsTimerRef.current = null;
+      }
+    };
+  }, [connectionsLive]);
+
+  useEffect(() => {
+    if (!framesLive || !selected) return undefined;
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    const scheduleRefresh = (event) => {
+      let frame = null;
+      try {
+        const payload = JSON.parse(event.data || "{}").payload || {};
+        frame = normalizeWebSocketFrame(payload.frame || payload);
+        if (!frame || frame.connection_id !== selected || !frameMatchesSearch(frame, search)) return;
+      } catch {
+        return;
+      }
+      frameBufferRef.current = mergeWebSocketFrames([frame], frameBufferRef.current);
+      if (framesTimerRef.current) return;
+      framesTimerRef.current = setTimeout(() => {
+        framesTimerRef.current = null;
+        const batch = frameBufferRef.current;
+        frameBufferRef.current = [];
+        setStreamedFrames((current) => mergeWebSocketFrames(batch, current).slice(0, frameLimit + 1));
+      }, 100);
+    };
+    source.addEventListener("websocket.frame", scheduleRefresh);
+    source.onerror = () => {
+      source.close();
+      setFramesLive(false);
+    };
+    return () => {
+      source.close();
+      if (framesTimerRef.current) {
+        clearTimeout(framesTimerRef.current);
+        framesTimerRef.current = null;
+      }
+      frameBufferRef.current = [];
+    };
+  }, [framesLive, selected, search, frameLimit]);
+
+  useEffect(() => {
+    const conns = state.data || [];
+    if (!selected && conns.length) setSelected(conns[0].id);
+  }, [state.data, selected]);
+  useEffect(() => {
+    setFrameLimit(framePageSize);
+    setStreamedFrames([]);
+  }, [selected, search]);
+  if ((state.loading || state.error) && !Array.isArray(state.data)) return <PageState state={state} />;
+  const conns = Array.isArray(state.data) ? state.data : [];
+  const active = conns.find((item) => item.id === selected);
+  const fetchedFrames = Array.isArray(framesState.data) ? framesState.data : [];
+  const allFrames = mergeWebSocketFrames(streamedFrames, fetchedFrames);
+  const frames = allFrames.slice(0, frameLimit);
+  const framesHasMore = allFrames.length > frameLimit || fetchedFrames.length > frameLimit;
+  const sendFrame = async () => {
+    await postJSON(`/api/websockets/connections/${encodeURIComponent(selected)}/send`, { ...sendForm, opcode: Number(sendForm.opcode) });
+    setSendForm({ ...sendForm, payload: "" });
+    refresh();
+  };
+  return (
+    <div className="workbench">
+      <aside className="workbench-sidebar">
+        <div className="workbench-head">
+          <div className="workbench-head-row">
+            <div><h2>WebSockets</h2><p>Captured connections and frames.</p></div>
+            <div className="actions">
+              <button className={connectionsLive ? "primary" : "secondary"} title={connectionsLive ? "Pause real-time connection list updates" : "Enable real-time connection list updates"} onClick={() => setConnectionsLive((value) => !value)}>
+                {connectionsLive ? <Pause /> : <Play />}{connectionsLive ? "Pause" : "Live"}
+              </button>
+            </div>
+          </div>
+        </div>
+        <div className="workbench-list">{conns.length ? conns.map((conn) => <button key={conn.id} className={`list-row ${conn.id === selected ? "active" : ""}`} onClick={() => setSelected(conn.id)}><div className="list-row-title"><Server /><span>{conn.host}</span></div><div className="list-row-meta">{conn.protocol} - {conn.frame_count || 0} frames</div><div className="list-row-meta">{conn.url}</div></button>) : <EmptyList>No WebSocket connections captured yet.</EmptyList>}</div>
+      </aside>
+      <section className="workbench-main">
+        {!active ? <EmptyDetail title="WebSocket Detail" body="Select a captured WebSocket connection." /> : <div className="detail-shell">
+          <div className="detail-topbar"><div className="detail-title"><h2>{active.host}</h2><div className="url-line">{active.url}</div></div><div className="detail-actions"><a className="secondary" href={`/api/websockets/connections/${encodeURIComponent(active.id)}/export?token=${encodeURIComponent(getToken())}`}><Download />Export</a></div></div>
+          <div className="grid metrics-grid compact"><Metric label="Protocol" value={active.protocol} /><Metric label="Frames" value={active.frame_count || 0} /><Metric label="Opened" value={active.created_at} /><Metric label="Closed" value={active.closed_at || "active"} /></div>
+          <div className="section-card"><div className="detail-topbar"><h3>Frames</h3><div className="frame-actions"><input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search payload, opcode, direction..." /><button className={framesLive ? "primary" : "secondary"} title={framesLive ? "Pause real-time frame updates" : "Enable real-time frame updates"} onClick={() => setFramesLive((value) => !value)}>{framesLive ? <Pause /> : <Play />}{framesLive ? "Pause" : "Live"}</button></div></div><table><thead><tr><th>Time</th><th>Direction</th><th>Opcode</th><th>Bytes</th><th>Payload</th></tr></thead><tbody>{frames.length ? frames.map((frame) => <tr key={frame.id}><td>{timeOnly(frame.created_at)}</td><td>{frame.direction}</td><td>{frame.opcode_name}</td><td>{frame.payload_bytes}</td><td><code>{frame.payload}</code>{frame.truncated && <span className="badge warn">truncated</span>}{frame.injected && <span className="badge allow">injected</span>}</td></tr>) : <tr><td colSpan="5">{framesState.loading ? "Loading frames..." : "No frames."}</td></tr>}</tbody></table><div className="table-footer"><span>{frames.length ? `Showing ${frames.length}${framesHasMore ? "+" : ""} newest frames` : ""}</span>{framesHasMore && <button className="secondary" onClick={() => setFrameLimit((value) => value + framePageSize)}>Load 20 More</button>}</div></div>
+          <div className="section-card"><h3>Send Frame</h3><div className="settings-grid"><label>Direction<select value={sendForm.direction} onChange={(e) => setSendForm({ ...sendForm, direction: e.target.value })}><option value="client_to_server">client to server</option><option value="server_to_client">server to client</option></select></label><label>Opcode<select value={sendForm.opcode} onChange={(e) => setSendForm({ ...sendForm, opcode: Number(e.target.value) })}><option value={1}>text</option><option value={2}>binary</option><option value={9}>ping</option><option value={10}>pong</option></select></label></div><textarea value={sendForm.payload} onChange={(e) => setSendForm({ ...sendForm, payload: e.target.value })} /><button className="primary" disabled={!selected} onClick={sendFrame}><Send />Send</button></div>
+        </div>}
+      </section>
+    </div>
+  );
+}
+
 function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes }) {
   const pageSize = 10;
   const [selected, setSelected] = useState("");
@@ -608,7 +933,7 @@ function TrafficView({ refreshKey, refresh, setCurrent, selectedScope, scopes })
             <a className="secondary" download="traffic.har" href={`/api/traffic/export?format=har&token=${encodeURIComponent(getToken())}`}><Download />HAR</a>
           </div>
           <div className="list-filter">
-            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search method, host, URL, status..." />
+            <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder='Search: host:example.com method:POST status:>=400 header:auth body:"token"' />
           </div>
         </div>
         <div className="workbench-list" onScroll={handleScroll}>
@@ -650,6 +975,26 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
   const reqHeaders = (flow.headers || []).filter((h) => h.direction === "request");
   const respHeaders = (flow.headers || []).filter((h) => h.direction === "response");
   const [aiState, setAIState] = useState({ loading: false, error: "", note: null });
+  const addInterceptRule = async () => {
+    const host = flow.host || hostFromURL(flow.url);
+    const method = String(flow.method || "GET").toUpperCase();
+    const contentType = headerRecordValue(reqHeaders, "Content-Type");
+    const rule = {
+      name: `Intercept ${method} ${host || "request"}`,
+      enabled: true,
+      priority: 100,
+      direction: "request",
+      host_patterns: host ? [host] : [],
+      method_patterns: method ? [method] : [],
+      status_patterns: [],
+      scope_ids: flow.scope_id ? [flow.scope_id] : [],
+      content_type_patterns: contentType ? [contentType.split(";")[0].trim()] : [],
+    };
+    const created = await postJSON("/api/intercept/rules", rule);
+    sessionStorage.setItem("selectedInterceptRule", created.id);
+    setCurrent("Intercept");
+    refresh();
+  };
   const runAI = async (action) => {
     setAIState({ loading: true, error: "", note: null });
     try {
@@ -661,12 +1006,14 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
   };
   return (
     <div className="detail-shell">
-      <div className="detail-topbar">
+      <div className="detail-topbar traffic-detail-head">
         <div className="detail-title">
-            <h2>Request Detail</h2>
+          <div className="detail-heading-line">
+            <h2>{flow.method || "Request"} {flow.host || hostFromURL(flow.url) || "Detail"}</h2>
             <ScopeBadge scopeID={flow.scope_id} scopes={scopes} />
             <ProxyUserBadge username={flow.proxy_user} />
-            <div className="url-line">{flow.url || ""}</div>
+          </div>
+          <div className="url-line" title={flow.url || ""}>{flow.url || ""}</div>
         </div>
         <div className="detail-actions">
           <a className="secondary" download={`traffic-${flow.id}.json`} href={`/api/traffic/${encodeURIComponent(flow.id)}/export?token=${encodeURIComponent(getToken())}`}><FileJson />JSON</a>
@@ -676,6 +1023,7 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
             sessionStorage.setItem("selectedRepeaterCase", created.id);
             setCurrent("Repeater");
           }}><Repeat />Clone</button>
+          <button className="secondary" onClick={addInterceptRule}><Pause />Intercept</button>
           <button className="secondary" onClick={async () => { await post(`/api/traffic/${encodeURIComponent(flow.id)}/replay`); refresh(); }}><Play />Replay</button>
           <button className="secondary" onClick={() => runAI("explain")}><Sparkles />Explain</button>
           <button className="secondary" onClick={() => runAI("suggest-tests")}><Bot />Suggest Tests</button>
@@ -687,6 +1035,8 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
         <Metric label="Status" value={flow.status || ""} />
         <Metric label="Duration" value={`${flow.duration_ms || 0} ms`} />
         <Metric label="Cache" value={flow.cache_hit ? "hit" : "miss"} />
+        <Metric label="Protocol" value={flow.protocol || ""} />
+        <Metric label="Bytes" value={flow.bytes || 0} />
       </div>
       <div className="split-grid">
         <CodeCard title="Query Params" value={flow.query_params || {}} />
@@ -700,6 +1050,20 @@ function TrafficDetail({ flow, scopes, setCurrent, refresh }) {
       </div>
     </div>
   );
+}
+
+function headerRecordValue(headers, name) {
+  const target = String(name || "").toLowerCase();
+  const found = (headers || []).find((header) => String(header.name || "").toLowerCase() === target);
+  return found?.value || "";
+}
+
+function hostFromURL(rawURL) {
+  try {
+    return new URL(rawURL).host;
+  } catch {
+    return "";
+  }
 }
 
 function RepeaterView({ refreshKey, refresh, selectedScope, scopes }) {
@@ -1616,11 +1980,13 @@ function SettingsView({ refreshKey, refresh }) {
   const aiCopilot = form.ai_copilot || {};
   const upstreamProxy = form.upstream_proxy || {};
   const proxyAuth = form.proxy_auth || {};
+  const intercept = form.intercept || {};
   const set = (patch) => setForm((prev) => ({ ...prev, ...patch }));
   const setCapture = (patch) => set({ traffic_capture: { ...capture, ...patch } });
   const setAICopilot = (patch) => set({ ai_copilot: { ...aiCopilot, ...patch } });
   const setUpstreamProxy = (patch) => set({ upstream_proxy: { ...upstreamProxy, ...patch } });
   const setProxyAuth = (patch) => set({ proxy_auth: { ...proxyAuth, ...patch } });
+  const setIntercept = (patch) => set({ intercept: { ...intercept, ...patch } });
   const danger = async (action, message) => {
     if (!confirm(message)) return;
     await postJSON("/api/settings/danger", { action, confirm: true });
@@ -1685,6 +2051,12 @@ function SettingsView({ refreshKey, refresh }) {
           <label><input type="checkbox" checked={!!proxyAuth.require_auth_for_loopback} onChange={(e) => setProxyAuth({ require_auth_for_loopback: e.target.checked })} /> Require auth for loopback clients</label>
         </div>
         <p className="muted">Manage proxy users and ordered ACL rules in Access Control. Passwords are hashed before storage.</p>
+        <h3>Intercept</h3>
+        <div className="settings-grid">
+          <label><input type="checkbox" checked={!!intercept.enabled} onChange={(e) => setIntercept({ enabled: e.target.checked })} /> Enable breakpoints</label>
+          <label>Timeout ms<input type="number" value={intercept.timeout_ms || 30000} onChange={(e) => setIntercept({ timeout_ms: Number(e.target.value) })} /></label>
+          <label>Timeout action<select value={intercept.timeout_action || "forward"} onChange={(e) => setIntercept({ timeout_action: e.target.value })}><option value="forward">forward</option><option value="drop">drop</option></select></label>
+        </div>
         <h3>Excluded Domains</h3>
         <textarea value={(form.excluded_domains || []).join("\n")} onChange={(e) => set({ excluded_domains: e.target.value.split("\n").map((s) => s.trim()).filter(Boolean) })} />
         <CodeCard title="Cache" value={form.cache || {}} />

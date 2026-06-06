@@ -461,6 +461,7 @@ pre {
   border: 1px solid var(--border);
   background: var(--ink-100);
   color: var(--fg-2);
+  white-space: nowrap;
 }
 
 .badge.block,
@@ -480,6 +481,18 @@ pre {
   background: var(--success-bg);
   color: var(--success-fg);
   border-color: var(--success-border);
+}
+
+.badge.timeout {
+  background: var(--ink-50);
+  color: var(--fg-2);
+  border-color: var(--border-strong);
+}
+
+.intercept-state {
+  min-width: 72px;
+  justify-content: center;
+  text-transform: capitalize;
 }
 
 .rowbutton {
@@ -633,6 +646,11 @@ textarea {
 .method-pill.put { background: #2563eb; }
 .method-pill.patch { background: #7c3aed; }
 .method-pill.delete { background: #dc2626; }
+
+.method-pill.small {
+  min-width: 42px;
+  padding-inline: 6px;
+}
 
 .scope-badge {
   display: inline-flex;
@@ -796,31 +814,75 @@ textarea {
   border-bottom: 1px solid var(--border);
 }
 
-.detail-title { min-width: 0; }
+.traffic-detail-head {
+  display: grid;
+  grid-template-columns: minmax(280px, 1fr) auto;
+  align-items: start;
+}
+
+.detail-title {
+  min-width: 0;
+  max-width: 100%;
+}
+
+.detail-heading-line {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
 .detail-title h2 {
   margin: 0 0 6px;
   font-size: 20px;
   font-weight: 700;
   letter-spacing: 0;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .url-line {
   color: var(--fg-2);
   font-family: var(--font-mono);
   font-size: 12px;
-  overflow-wrap: anywhere;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 
 .detail-actions {
-  flex: 0 0 auto;
+  min-width: 0;
   display: flex;
+  justify-content: flex-end;
   gap: 8px;
   flex-wrap: wrap;
+}
+
+.detail-actions .secondary,
+.detail-actions .primary {
+  white-space: nowrap;
 }
 
 .detail-actions button:disabled {
   opacity: 0.55;
   cursor: not-allowed;
+}
+
+.frame-actions {
+  min-width: 0;
+  display: flex;
+  flex: 1;
+  gap: 8px;
+  align-items: center;
+}
+
+.frame-actions input {
+  min-width: 220px;
+  flex: 1;
 }
 
 .section-card {
@@ -835,6 +897,21 @@ textarea {
   font-size: 15px;
   font-weight: 600;
 }
+
+.intercept-queue-table {
+  table-layout: fixed;
+}
+
+.intercept-queue-table td {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  overflow-wrap: normal;
+}
+
+.intercept-queue-table td:nth-child(1) { width: 104px; }
+.intercept-queue-table td:nth-child(2) { width: 82px; }
+.intercept-queue-table td:nth-child(3) { width: 64px; }
 
 .table-footer {
   min-height: 45px;
@@ -944,6 +1021,14 @@ textarea {
   margin: 12px 0 18px;
 }
 
+.toggle-row {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+  font-weight: 700;
+  color: var(--fg);
+}
+
 .stacked-label {
   display: grid;
   gap: 6px;
@@ -1001,6 +1086,18 @@ textarea {
   .split-grid {
     grid-template-columns: 1fr;
   }
+  .traffic-detail-head {
+    grid-template-columns: 1fr;
+  }
+  .detail-actions {
+    justify-content: flex-start;
+  }
+  .section-card .detail-topbar {
+    flex-wrap: wrap;
+  }
+  .frame-actions {
+    flex-basis: 100%;
+  }
 }
 
 @media (max-width: 760px) {
@@ -1010,13 +1107,54 @@ textarea {
   }
   .sidebar {
     display: flex;
+    gap: 6px;
     overflow-x: auto;
+    overflow-y: hidden;
     border-right: 0;
     border-bottom: 1px solid var(--border);
+    padding: 8px 10px;
+    scrollbar-width: thin;
   }
+  .sidebar > div { display: contents; }
   .navgroup { display: none; }
-  .sidebar button { min-width: max-content; }
+  .sidebar button {
+    width: auto;
+    min-width: max-content;
+    min-height: 34px;
+    margin-bottom: 0;
+    padding: 7px 10px;
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
+  .sidebar button.active::before {
+    left: 8px;
+    right: 8px;
+    top: auto;
+    bottom: 0;
+    width: auto;
+    height: 2px;
+  }
   .page { padding: 14px; }
   .topbar { flex-wrap: wrap; height: auto; min-height: 56px; padding-block: 10px; }
   .status-pill { margin-left: 0; }
+}
+
+@media (max-width: 560px) {
+  .topbar {
+    gap: 8px;
+    padding-inline: 12px;
+  }
+  .brand {
+    flex-basis: 100%;
+  }
+  .env-pill,
+  .status-pill {
+    padding-inline: 9px;
+  }
+  .scope-select {
+    flex: 1 1 220px;
+  }
+  .scope-select select {
+    width: 100%;
+  }
 }

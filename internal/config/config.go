@@ -79,6 +79,9 @@ type Config struct {
 	// Traffic capture controls body persistence for dashboard inspection.
 	TrafficCapture TrafficCaptureConfig `json:"traffic_capture"`
 
+	// Intercept controls live request/response breakpoint behavior.
+	Intercept InterceptConfig `json:"intercept"`
+
 	// Deprecated legacy flat caching fields (supported for backward compatibility)
 	CacheEnabledLegacy      bool     `json:"cache_enabled"`
 	CacheDirLegacy          string   `json:"cache_dir"`
@@ -168,6 +171,12 @@ type TrafficCaptureConfig struct {
 	RedactedCookies []string `json:"redacted_cookies"`
 }
 
+type InterceptConfig struct {
+	Enabled       bool   `json:"enabled"`
+	TimeoutMS     int    `json:"timeout_ms"`
+	TimeoutAction string `json:"timeout_action"`
+}
+
 // defaultConfig returns a Config with sensible defaults.
 func defaultConfig() *Config {
 	return &Config{
@@ -210,6 +219,15 @@ func defaultConfig() *Config {
 			RedactedHeaders: defaultRedactedHeaders(),
 			StoreCookies:    true,
 		},
+		Intercept: defaultInterceptConfig(),
+	}
+}
+
+func defaultInterceptConfig() InterceptConfig {
+	return InterceptConfig{
+		Enabled:       false,
+		TimeoutMS:     30000,
+		TimeoutAction: "forward",
 	}
 }
 
@@ -337,6 +355,7 @@ func Load(path string) (*Config, error) {
 	applyUpstreamProxyDefaults(&cfg.UpstreamProxy)
 	applyProxyAuthDefaults(&cfg.ProxyAuth)
 	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
+	applyInterceptDefaults(&cfg.Intercept)
 
 	if strings.TrimSpace(cfg.AdminAddr) == "" {
 		cfg.AdminAddr = "127.0.0.1:9090"
@@ -374,10 +393,38 @@ func Load(path string) (*Config, error) {
 	if err := cfg.ValidateProxyAuth(); err != nil {
 		return nil, err
 	}
+	if err := cfg.ValidateIntercept(); err != nil {
+		return nil, err
+	}
 
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+func applyInterceptDefaults(c *InterceptConfig) {
+	defaults := defaultInterceptConfig()
+	if c.TimeoutMS == 0 {
+		c.TimeoutMS = defaults.TimeoutMS
+	}
+	if c.TimeoutAction == "" {
+		c.TimeoutAction = defaults.TimeoutAction
+	}
+}
+
+func (c *Config) ValidateIntercept() error {
+	action := strings.ToLower(strings.TrimSpace(c.Intercept.TimeoutAction))
+	if action == "" {
+		return nil
+	}
+	if action != "forward" && action != "drop" {
+		return fmt.Errorf("invalid config: intercept.timeout_action must be forward or drop")
+	}
+	if c.Intercept.TimeoutMS < 0 {
+		return fmt.Errorf("invalid config: intercept.timeout_ms must be non-negative")
+	}
+	c.Intercept.TimeoutAction = action
+	return nil
 }
 
 func applyProxyAuthDefaults(c *ProxyAuthConfig) {

@@ -47,6 +47,10 @@ var DashboardTables = []string{
 	"pentest_endpoints",
 	"pentest_parameters",
 	"pentest_observations",
+	"intercept_rules",
+	"intercept_pending",
+	"websocket_connections",
+	"websocket_frames",
 }
 
 type AuditEntry struct {
@@ -268,6 +272,81 @@ type AINote struct {
 	Title      string          `json:"title"`
 	Summary    string          `json:"summary,omitempty"`
 	Content    json.RawMessage `json:"content_json"`
+}
+
+type InterceptRule struct {
+	ID                  string    `json:"id"`
+	CreatedAt           time.Time `json:"created_at"`
+	UpdatedAt           time.Time `json:"updated_at"`
+	Name                string    `json:"name"`
+	Enabled             bool      `json:"enabled"`
+	Priority            int       `json:"priority"`
+	Direction           string    `json:"direction"`
+	HostPatterns        []string  `json:"host_patterns,omitempty"`
+	MethodPatterns      []string  `json:"method_patterns,omitempty"`
+	StatusPatterns      []string  `json:"status_patterns,omitempty"`
+	ScopeIDs            []string  `json:"scope_ids,omitempty"`
+	ContentTypePatterns []string  `json:"content_type_patterns,omitempty"`
+}
+
+type InterceptMessage struct {
+	Method    string              `json:"method,omitempty"`
+	URL       string              `json:"url,omitempty"`
+	Host      string              `json:"host,omitempty"`
+	Status    int                 `json:"status,omitempty"`
+	Headers   map[string][]string `json:"headers,omitempty"`
+	Body      string              `json:"body,omitempty"`
+	Protocol  string              `json:"protocol,omitempty"`
+	MIMEType  string              `json:"mime_type,omitempty"`
+	RemoteIP  string              `json:"remote_ip,omitempty"`
+	ScopeID   string              `json:"scope_id,omitempty"`
+	ProxyUser string              `json:"proxy_user,omitempty"`
+	RuleID    string              `json:"rule_id,omitempty"`
+	Direction string              `json:"direction,omitempty"`
+	RequestID string              `json:"request_id,omitempty"`
+	CreatedAt time.Time           `json:"created_at,omitempty"`
+	TimeoutAt time.Time           `json:"timeout_at,omitempty"`
+}
+
+type PendingIntercept struct {
+	ID             string           `json:"id"`
+	CreatedAt      time.Time        `json:"created_at"`
+	UpdatedAt      time.Time        `json:"updated_at"`
+	RequestID      string           `json:"request_id"`
+	RuleID         string           `json:"rule_id,omitempty"`
+	Direction      string           `json:"direction"`
+	State          string           `json:"state"`
+	TimeoutAt      time.Time        `json:"timeout_at"`
+	TimeoutAction  string           `json:"timeout_action"`
+	Original       InterceptMessage `json:"original"`
+	Edited         InterceptMessage `json:"edited"`
+	ResolutionNote string           `json:"resolution_note,omitempty"`
+}
+
+type WebSocketConnection struct {
+	ID         string     `json:"id"`
+	CreatedAt  time.Time  `json:"created_at"`
+	ClosedAt   *time.Time `json:"closed_at,omitempty"`
+	URL        string     `json:"url"`
+	Host       string     `json:"host"`
+	Protocol   string     `json:"protocol"`
+	RemoteIP   string     `json:"remote_ip,omitempty"`
+	ScopeID    string     `json:"scope_id,omitempty"`
+	ProxyUser  string     `json:"proxy_user,omitempty"`
+	FrameCount int        `json:"frame_count,omitempty"`
+}
+
+type WebSocketFrame struct {
+	ID           string    `json:"id"`
+	ConnectionID string    `json:"connection_id"`
+	CreatedAt    time.Time `json:"created_at"`
+	Direction    string    `json:"direction"`
+	Opcode       int       `json:"opcode"`
+	OpcodeName   string    `json:"opcode_name"`
+	Payload      string    `json:"payload,omitempty"`
+	PayloadBytes int64     `json:"payload_bytes"`
+	Truncated    bool      `json:"truncated"`
+	Injected     bool      `json:"injected"`
 }
 
 type AINoteFilter struct {
@@ -814,6 +893,57 @@ func (s *Store) migrate(ctx context.Context) error {
 			evidence_json TEXT NOT NULL,
 			representative_flow_id TEXT
 		)`,
+		`CREATE TABLE IF NOT EXISTS intercept_rules (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			name TEXT NOT NULL,
+			enabled INTEGER NOT NULL DEFAULT 1,
+			priority INTEGER NOT NULL,
+			direction TEXT NOT NULL,
+			host_patterns_json TEXT NOT NULL,
+			method_patterns_json TEXT NOT NULL,
+			status_patterns_json TEXT NOT NULL,
+			scope_ids_json TEXT NOT NULL,
+			content_type_patterns_json TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS intercept_pending (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			updated_at TEXT NOT NULL,
+			request_id TEXT NOT NULL,
+			rule_id TEXT,
+			direction TEXT NOT NULL,
+			state TEXT NOT NULL,
+			timeout_at TEXT NOT NULL,
+			timeout_action TEXT NOT NULL,
+			original_json TEXT NOT NULL,
+			edited_json TEXT NOT NULL,
+			resolution_note TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS websocket_connections (
+			id TEXT PRIMARY KEY,
+			created_at TEXT NOT NULL,
+			closed_at TEXT,
+			url TEXT NOT NULL,
+			host TEXT NOT NULL,
+			protocol TEXT NOT NULL,
+			remote_ip TEXT,
+			scope_id TEXT,
+			proxy_user TEXT
+		)`,
+		`CREATE TABLE IF NOT EXISTS websocket_frames (
+			id TEXT PRIMARY KEY,
+			connection_id TEXT NOT NULL,
+			created_at TEXT NOT NULL,
+			direction TEXT NOT NULL,
+			opcode INTEGER NOT NULL,
+			opcode_name TEXT NOT NULL,
+			payload TEXT,
+			payload_bytes INTEGER NOT NULL,
+			truncated INTEGER NOT NULL DEFAULT 0,
+			injected INTEGER NOT NULL DEFAULT 0
+		)`,
 	}
 
 	for _, statement := range statements {
@@ -833,6 +963,10 @@ func (s *Store) migrate(ctx context.Context) error {
 	_ = s.addColumnIfMissing(ctx, "admin_users", "role", "TEXT NOT NULL DEFAULT 'read'")
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM certificates WHERE id NOT IN (SELECT MAX(id) FROM certificates GROUP BY COALESCE(host, ''))`)
 	_, _ = s.db.ExecContext(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS idx_certificates_host ON certificates(host)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_intercept_pending_state ON intercept_pending(state, created_at)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_websocket_frames_conn_time ON websocket_frames(connection_id, created_at)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_traffic_headers_flow_name ON traffic_headers(flow_id, name)`)
+	_, _ = s.db.ExecContext(ctx, `CREATE INDEX IF NOT EXISTS idx_threat_events_url_host ON threat_events(url, host)`)
 
 	return nil
 }

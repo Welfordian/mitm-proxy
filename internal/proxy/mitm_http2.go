@@ -56,6 +56,15 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr strin
 			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, threatsFromPolicy(decision))
 			return
 		}
+		dropped, err := p.interceptRequest(req.Context(), req, requestID)
+		if err != nil {
+			http.Error(w, "intercept error", http.StatusBadGateway)
+			return
+		}
+		if dropped {
+			http.Error(w, "dropped by intercept", http.StatusForbidden)
+			return
+		}
 
 		verdict, scanErr := p.scanRequest(req.Context(), req)
 		if p.shouldBlock(verdict, scanErr) {
@@ -74,8 +83,18 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr strin
 					writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 					return
 				}
+				body := cr.Body
+				body, dropped, err = p.interceptBufferedResponse(req.Context(), req, cachedResp, body, requestID)
+				if err != nil {
+					http.Error(w, "intercept error", http.StatusBadGateway)
+					return
+				}
+				if dropped {
+					http.Error(w, "dropped by intercept", http.StatusForbidden)
+					return
+				}
 
-				for k, vv := range cr.Header {
+				for k, vv := range cachedResp.Header {
 					for _, v := range vv {
 						w.Header().Add(k, v)
 					}
@@ -88,11 +107,11 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr strin
 				uidHeader := p.makeCustomHeader("uid")
 
 				w.Header().Set(uidHeader, hashHex)
-				w.WriteHeader(cr.Status)
-				n, _ := w.Write(cr.Body)
+				w.WriteHeader(cachedResp.StatusCode)
+				n, _ := w.Write(body)
 
 				p.logRequest("CACHE HIT HTTPS/2 %s %s -> status=%d, bytes=%d, dur=%s", req.Method, req.URL.String(), cr.Status, n, time.Since(start))
-				p.publishTrafficCompleted(requestID, req, cr.Status, n, time.Since(start), true, cr.Header)
+				p.publishTrafficCompleted(requestID, req, cachedResp.StatusCode, n, time.Since(start), true, cachedResp.Header)
 
 				return
 			}
@@ -120,6 +139,15 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr strin
 				writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
 				return
 			}
+			body, dropped, err = p.interceptBufferedResponse(req.Context(), req, resp, body, requestID)
+			if err != nil {
+				http.Error(w, "intercept error", http.StatusBadGateway)
+				return
+			}
+			if dropped {
+				http.Error(w, "dropped by intercept", http.StatusForbidden)
+				return
+			}
 
 			for k, vv := range resp.Header {
 				for _, v := range vv {
@@ -140,6 +168,15 @@ func (p *Proxy) mitmHTTPS2(clientTLS net.Conn, host, proxyUser, remoteAddr strin
 		verdict, scanErr = p.prepareResponseForScan(req.Context(), req, resp)
 		if p.shouldBlock(verdict, scanErr) {
 			writeThreatBlockedResponse(w, p.cfg().BlockResponseStatus, verdict)
+			return
+		}
+		dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
+		if err != nil {
+			http.Error(w, "intercept error", http.StatusBadGateway)
+			return
+		}
+		if dropped {
+			http.Error(w, "dropped by intercept", http.StatusForbidden)
 			return
 		}
 

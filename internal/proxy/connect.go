@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"crypto/tls"
+	"errors"
 	"io"
 	"log"
 	"net"
@@ -149,7 +150,11 @@ func (p *Proxy) handleConnect(w http.ResponseWriter, r *http.Request) {
 	})
 
 	if err := tlsConn.Handshake(); err != nil {
-		log.Printf("TLS handshake with client failed: %v", err)
+		if errors.Is(err, io.EOF) {
+			p.logVerbose("TLS handshake aborted by client for %s from %s: %v", hostPort, r.RemoteAddr, err)
+		} else {
+			log.Printf("TLS handshake with client failed for %s from %s: %v", hostPort, r.RemoteAddr, err)
+		}
 
 		tlsConn.Close()
 

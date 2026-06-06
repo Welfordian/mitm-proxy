@@ -83,6 +83,17 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			_ = blocked.Write(clientTLS)
 			continue
 		}
+		dropped, err := p.interceptRequest(req.Context(), req, requestID)
+		if err != nil {
+			log.Printf("intercept request error: %v", err)
+			clientTLS.Close()
+			return
+		}
+		if dropped {
+			blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
+			_ = blocked.Write(clientTLS)
+			continue
+		}
 
 		verdict, scanErr := p.scanRequest(req.Context(), req)
 		if p.shouldBlock(verdict, scanErr) {
@@ -103,11 +114,23 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 					_ = blocked.Write(clientTLS)
 					continue
 				}
+				body := cr.Body
+				body, dropped, err = p.interceptBufferedResponse(req.Context(), req, cachedResp, body, requestID)
+				if err != nil {
+					log.Printf("intercept response error: %v", err)
+					clientTLS.Close()
+					return
+				}
+				if dropped {
+					blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
+					_ = blocked.Write(clientTLS)
+					continue
+				}
 
 				// write cached response directly to TLS conn
 				hdr := make(http.Header)
 
-				for k, vv := range cr.Header {
+				for k, vv := range cachedResp.Header {
 					for _, v := range vv {
 						hdr.Add(k, v)
 					}
@@ -120,11 +143,11 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 				uidHeader := p.makeCustomHeader("uid")
 				hdr.Set(uidHeader, hashHex)
 
-				cached := &http.Response{StatusCode: cr.Status, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: hdr, Body: io.NopCloser(bytes.NewReader(cr.Body))}
+				cached := &http.Response{StatusCode: cachedResp.StatusCode, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: hdr, Body: io.NopCloser(bytes.NewReader(body))}
 				_ = cached.Write(clientTLS)
 
 				p.logRequest("CACHE HIT HTTPS/1.1 %s %s -> status=%d, dur=%s", req.Method, req.URL.String(), cr.Status, time.Since(start))
-				p.publishTrafficCompleted(requestID, req, cr.Status, len(cr.Body), time.Since(start), true, cr.Header)
+				p.publishTrafficCompleted(requestID, req, cachedResp.StatusCode, len(body), time.Since(start), true, cachedResp.Header)
 
 				continue
 			}
@@ -152,6 +175,17 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 				_ = blocked.Write(clientTLS)
 				continue
 			}
+			body, dropped, err = p.interceptBufferedResponse(req.Context(), req, resp, body, requestID)
+			if err != nil {
+				log.Printf("intercept response error: %v", err)
+				clientTLS.Close()
+				return
+			}
+			if dropped {
+				blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
+				_ = blocked.Write(clientTLS)
+				continue
+			}
 
 			// Construct response to write
 			out := &http.Response{StatusCode: resp.StatusCode, Proto: "HTTP/1.1", ProtoMajor: 1, ProtoMinor: 1, Header: resp.Header.Clone(), Body: io.NopCloser(bytes.NewReader(body))}
@@ -175,6 +209,19 @@ func (p *Proxy) mitmHTTPS11(clientTLS net.Conn, host, proxyUser, remoteAddr stri
 			if p.shouldBlock(verdict, scanErr) {
 				resp.Body.Close()
 				blocked := threatBlockedResponse(verdict)
+				_ = blocked.Write(clientTLS)
+				continue
+			}
+			dropped, err = p.interceptStreamingResponse(req.Context(), req, resp, requestID)
+			if err != nil {
+				resp.Body.Close()
+				log.Printf("intercept response error: %v", err)
+				clientTLS.Close()
+				return
+			}
+			if dropped {
+				resp.Body.Close()
+				blocked := threatBlockedResponse(threatsFromPolicyString("dropped by intercept"))
 				_ = blocked.Write(clientTLS)
 				continue
 			}
@@ -221,6 +268,7 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 		return
 	}
 	req.Header.Del("Proxy-Authorization")
+	stripWebSocketCompression(req.Header)
 
 	rawUpstream, err := upstream.DialContext(req.Context(), p.cfg(), targetHost)
 
@@ -294,18 +342,9 @@ func (p *Proxy) handleWebSocketHTTPS11(clientTLS net.Conn, req *http.Request, ho
 
 	p.logVerbose("wss tunnel established %s <-> %s", clientTLS.RemoteAddr(), targetHost)
 	p.publishTunnelOpened(targetHost, "wss", clientTLS.RemoteAddr().String())
-
-	go func() {
-		defer clientTLS.Close()
-		defer upstreamTLS.Close()
-
-		io.Copy(upstreamTLS, clientTLS)
-	}()
-
-	go func() {
-		defer clientTLS.Close()
-		defer upstreamTLS.Close()
-
-		io.Copy(clientTLS, upstreamTLS)
-	}()
+	rawURL := req.URL.String()
+	if rawURL == "" {
+		rawURL = "wss://" + targetHost + req.URL.RequestURI()
+	}
+	p.startWebSocketInspection(req.Context(), requestID(time.Now()), rawURL, targetHost, "wss", remoteAddr, proxyUser, clientTLS, upstreamTLS, upstreamReader)
 }

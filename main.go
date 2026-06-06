@@ -18,8 +18,10 @@ import (
 	capkg "mitm-proxy/internal/ca"
 	cfgpkg "mitm-proxy/internal/config"
 	"mitm-proxy/internal/events"
+	"mitm-proxy/internal/intercept"
 	proxypkg "mitm-proxy/internal/proxy"
 	"mitm-proxy/internal/store"
+	"mitm-proxy/internal/wsinspect"
 )
 
 const (
@@ -144,6 +146,10 @@ func main() {
 	proxy := proxypkg.NewWithEvents(ca, config, eventBus)
 	proxy.SetCacheStore(cacheStore)
 	proxy.SetAccessStore(cacheStore)
+	interceptManager := intercept.NewManager(proxy.CurrentConfig, cacheStore, eventBus)
+	proxy.SetInterceptManager(interceptManager)
+	webSocketManager := wsinspect.NewManager(cacheStore)
+	proxy.SetWebSocketManager(webSocketManager)
 	var proxyServer *http.Server
 	var adminServer *adminpkg.Server
 	var restartMu sync.Mutex
@@ -182,6 +188,8 @@ func main() {
 			ProxyStarted:  startedAt,
 			GeneratedAuth: generatedAuth,
 			ThreatScanner: proxy.ThreatScanner(),
+			Intercept:     interceptManager,
+			WebSockets:    webSocketManager,
 			EventBus:      eventBus,
 			SaveConfig: func(_ context.Context, cfg *cfgpkg.Config) error {
 				path := cfgPathForWrite(*configPath)
