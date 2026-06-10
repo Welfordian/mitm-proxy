@@ -20,7 +20,7 @@ func (m Middleware) Wrap(next http.Handler) http.Handler {
 		}
 
 		token := bearerToken(r.Header.Get("Authorization"))
-		if token == "" {
+		if token == "" && queryTokenAllowed(r) {
 			token = r.URL.Query().Get("token")
 		}
 
@@ -44,6 +44,10 @@ func isReadOnly(r *http.Request) bool {
 	if r.Method == http.MethodPost && r.URL.Path == "/api/proxy-acl/test" {
 		return true
 	}
+	return r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
+}
+
+func queryTokenAllowed(r *http.Request) bool {
 	return r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions
 }
 

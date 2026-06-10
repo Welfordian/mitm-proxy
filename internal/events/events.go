@@ -22,9 +22,9 @@ const (
 	TopicDeploymentUpdated        = "deployment.updated"
 	TopicCacheHit                 = "cache.hit"
 	TopicCacheMiss                = "cache.miss"
-	TopicFaultInjected           = "fault.injected"
-	TopicTimelineEntry           = "timeline.entry"
-	TopicHostProfileMatched      = "host_profile.matched"
+	TopicFaultInjected            = "fault.injected"
+	TopicTimelineEntry            = "timeline.entry"
+	TopicHostProfileMatched       = "host_profile.matched"
 )
 
 type Event struct {
@@ -37,7 +37,6 @@ type Event struct {
 
 type EventBus interface {
 	Publish(event Event)
-	Subscribe(topic string) <-chan Event
 }
 
 type Bus struct {
@@ -87,17 +86,40 @@ func (b *Bus) Publish(event Event) {
 	}
 }
 
-func (b *Bus) Subscribe(topic string) <-chan Event {
+func (b *Bus) Subscribe(topic string) (<-chan Event, func()) {
 	if topic == "" {
 		topic = "*"
 	}
 
 	ch := make(chan Event, b.buffer)
+	cancelled := false
 	b.mu.Lock()
 	b.subscribers[topic] = append(b.subscribers[topic], ch)
 	b.mu.Unlock()
 
-	return ch
+	cancel := func() {
+		b.mu.Lock()
+		defer b.mu.Unlock()
+		if cancelled {
+			return
+		}
+		cancelled = true
+		subscribers := b.subscribers[topic]
+		for i, subscriber := range subscribers {
+			if subscriber == ch {
+				copy(subscribers[i:], subscribers[i+1:])
+				subscribers = subscribers[:len(subscribers)-1]
+				break
+			}
+		}
+		if len(subscribers) == 0 {
+			delete(b.subscribers, topic)
+			return
+		}
+		b.subscribers[topic] = subscribers
+	}
+
+	return ch, cancel
 }
 
 func (b *Bus) Recent(topic string, limit int) []Event {

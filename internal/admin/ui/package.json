@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "vite --host 127.0.0.1",
     "build": "vite build",
+    "check:dist": "npm run build && git diff --exit-code -- dist",
     "preview": "vite preview --host 127.0.0.1"
   },
   "dependencies": {

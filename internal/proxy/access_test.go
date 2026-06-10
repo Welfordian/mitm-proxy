@@ -38,7 +38,8 @@ func TestPlainHTTPProxyAuthAndHeaderStripping(t *testing.T) {
 	defer target.Close()
 
 	bus := events.NewBus(16)
-	ch := bus.Subscribe("*")
+	ch, cancel := bus.Subscribe("*")
+	defer cancel()
 	go func() {
 		for event := range ch {
 			_ = st.RecordEvent(context.Background(), event)

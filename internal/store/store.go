@@ -1946,17 +1946,84 @@ func (s *Store) GetTrafficDetail(ctx context.Context, id string) (TrafficDetail,
 	if err != nil {
 		return TrafficDetail{}, false, err
 	}
+	requestBody, responseBody, err := s.getTrafficBodies(ctx, id)
+	if err != nil {
+		return TrafficDetail{}, false, err
+	}
+	return trafficDetailFromParts(flow, headers, requestBody, responseBody), true, nil
+}
+
+func (s *Store) ListTrafficDetailsScopedPage(ctx context.Context, limit, offset int, scopeID string, includeOutOfScope bool, search string) ([]TrafficDetail, error) {
+	flows, err := s.ListTrafficScopedPage(ctx, limit, offset, scopeID, includeOutOfScope, search)
+	if err != nil {
+		return nil, err
+	}
+	if len(flows) == 0 {
+		return []TrafficDetail{}, nil
+	}
+
+	ids := make([]string, 0, len(flows))
+	details := make([]TrafficDetail, len(flows))
+	indexByID := make(map[string]int, len(flows))
+	for i, flow := range flows {
+		ids = append(ids, flow.ID)
+		indexByID[flow.ID] = i
+		details[i] = TrafficDetail{
+			TrafficFlow: flow,
+			QueryParams: map[string][]string{},
+			Cookies:     map[string]string{},
+		}
+		if parsed, err := url.Parse(flow.URL); err == nil {
+			details[i].QueryParams = parsed.Query()
+		}
+	}
+
+	headersByFlow, err := s.listTrafficHeadersForFlows(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for flowID, headers := range headersByFlow {
+		if i, ok := indexByID[flowID]; ok {
+			details[i].Headers = headers
+			populateTrafficCookies(&details[i])
+		}
+	}
+
+	bodiesByFlow, err := s.listTrafficBodiesForFlows(ctx, ids)
+	if err != nil {
+		return nil, err
+	}
+	for flowID, bodies := range bodiesByFlow {
+		if i, ok := indexByID[flowID]; ok {
+			details[i].RequestBody = bodies.request
+			details[i].ResponseBody = bodies.response
+		}
+	}
+
+	return details, nil
+}
+
+func trafficDetailFromParts(flow TrafficFlow, headers []HeaderRecord, requestBody, responseBody string) TrafficDetail {
 	detail := TrafficDetail{
-		TrafficFlow: flow,
-		Headers:     headers,
-		QueryParams: map[string][]string{},
-		Cookies:     map[string]string{},
+		TrafficFlow:  flow,
+		Headers:      headers,
+		QueryParams:  map[string][]string{},
+		Cookies:      map[string]string{},
+		RequestBody:  requestBody,
+		ResponseBody: responseBody,
 	}
 	if parsed, err := url.Parse(flow.URL); err == nil {
 		detail.QueryParams = parsed.Query()
 	}
-	detail.RequestBody, detail.ResponseBody, _ = s.getTrafficBodies(ctx, id)
-	for _, header := range headers {
+	populateTrafficCookies(&detail)
+	return detail
+}
+
+func populateTrafficCookies(detail *TrafficDetail) {
+	if detail.Cookies == nil {
+		detail.Cookies = map[string]string{}
+	}
+	for _, header := range detail.Headers {
 		if header.Direction != "request" || !strings.EqualFold(header.Name, "Cookie") {
 			continue
 		}
@@ -1967,7 +2034,6 @@ func (s *Store) GetTrafficDetail(ctx context.Context, id string) (TrafficDetail,
 			}
 		}
 	}
-	return detail, true, nil
 }
 
 func (s *Store) getTrafficBodies(ctx context.Context, id string) (string, string, error) {
@@ -2004,6 +2070,78 @@ func (s *Store) ListTrafficHeaders(ctx context.Context, flowID string) ([]Header
 		return nil, fmt.Errorf("iterate traffic headers: %w", err)
 	}
 	return headers, nil
+}
+
+func (s *Store) listTrafficHeadersForFlows(ctx context.Context, flowIDs []string) (map[string][]HeaderRecord, error) {
+	out := make(map[string][]HeaderRecord, len(flowIDs))
+	if len(flowIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := stringPlaceholders(flowIDs)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT flow_id, direction, name, value FROM traffic_headers WHERE flow_id IN (`+placeholders+`) ORDER BY flow_id ASC, id ASC`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic headers: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var flowID string
+		var header HeaderRecord
+		if err := rows.Scan(&flowID, &header.Direction, &header.Name, &header.Value); err != nil {
+			return nil, fmt.Errorf("scan traffic header: %w", err)
+		}
+		out[flowID] = append(out[flowID], header)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic headers: %w", err)
+	}
+	return out, nil
+}
+
+type trafficBodies struct {
+	request  string
+	response string
+}
+
+func (s *Store) listTrafficBodiesForFlows(ctx context.Context, flowIDs []string) (map[string]trafficBodies, error) {
+	out := make(map[string]trafficBodies, len(flowIDs))
+	if len(flowIDs) == 0 {
+		return out, nil
+	}
+	placeholders, args := stringPlaceholders(flowIDs)
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT flow_id, COALESCE(request_body, ''), COALESCE(response_body, '') FROM traffic_bodies WHERE flow_id IN (`+placeholders+`)`, args...)
+	if err != nil {
+		return nil, fmt.Errorf("query traffic bodies: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var flowID string
+		var requestBody, responseBody []byte
+		if err := rows.Scan(&flowID, &requestBody, &responseBody); err != nil {
+			return nil, fmt.Errorf("scan traffic bodies: %w", err)
+		}
+		out[flowID] = trafficBodies{request: string(requestBody), response: string(responseBody)}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate traffic bodies: %w", err)
+	}
+	return out, nil
+}
+
+func stringPlaceholders(values []string) (string, []any) {
+	var b strings.Builder
+	args := make([]any, 0, len(values))
+	for i, value := range values {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		b.WriteByte('?')
+		args = append(args, value)
+	}
+	return b.String(), args
 }
 
 func (s *Store) ClearTraffic(ctx context.Context) error {

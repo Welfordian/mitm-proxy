@@ -192,6 +192,20 @@ func TestAdminUIRoutesServeIndexAndPreserveTokenRedirect(t *testing.T) {
 	}
 }
 
+func TestQueryTokenDoesNotAuthenticateMutations(t *testing.T) {
+	s := New(Options{
+		Token:  "admin-token",
+		Config: func() *cfgpkg.Config { return &cfgpkg.Config{} },
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/settings?token=admin-token", strings.NewReader(`{"enable_mitm":true}`))
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.server.Handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusUnauthorized {
+		t.Fatalf("expected mutation query token to be rejected, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
 func TestDeploymentRestartCallsConfiguredRestart(t *testing.T) {
 	called := false
 	s := New(Options{
@@ -260,6 +274,56 @@ func TestSettingsDangerRequiresConfirmationAndPurges(t *testing.T) {
 	postJSONForTest(t, s, "/api/settings/danger", map[string]any{"action": "all", "confirm": true})
 	if flows, err := st.ListTraffic(context.Background(), 10); err != nil || len(flows) != 0 {
 		t.Fatalf("expected all data purge to clear traffic, flows=%+v err=%v", flows, err)
+	}
+}
+
+func TestSettingsRejectsInvalidCacheFilters(t *testing.T) {
+	s := New(Options{
+		Token:  "admin-token",
+		Config: func() *cfgpkg.Config { return &cfgpkg.Config{} },
+	})
+	body, _ := json.Marshal(map[string]any{
+		"cache": map[string]any{
+			"include_domains": []string{"example.test"},
+			"exclude_domains": []string{"other.test"},
+		},
+	})
+	req := httptest.NewRequest(http.MethodPut, "/api/settings", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer admin-token")
+	req.Header.Set("Content-Type", "application/json")
+	rr := httptest.NewRecorder()
+	s.server.Handler.ServeHTTP(rr, req)
+	if rr.Code != http.StatusBadRequest {
+		t.Fatalf("expected invalid cache filters to be rejected, got %d: %s", rr.Code, rr.Body.String())
+	}
+}
+
+func TestSettingsApplySharedDefaults(t *testing.T) {
+	var applied *cfgpkg.Config
+	s := New(Options{
+		Token:  "admin-token",
+		Config: func() *cfgpkg.Config { return &cfgpkg.Config{} },
+		ApplyConfig: func(cfg *cfgpkg.Config) {
+			applied = cfg
+		},
+	})
+
+	putJSONForTest(t, s, "/api/settings", map[string]any{
+		"proxy_auth": map[string]any{"enabled": true},
+		"intercept":  map[string]any{"enabled": true},
+	})
+
+	if applied == nil {
+		t.Fatal("expected config to be applied")
+	}
+	if applied.ProxyAuth.DefaultAction != "deny" || applied.ProxyAuth.Realm == "" {
+		t.Fatalf("expected proxy auth defaults to be applied: %+v", applied.ProxyAuth)
+	}
+	if applied.Intercept.TimeoutMS == 0 || applied.Intercept.TimeoutAction != "forward" {
+		t.Fatalf("expected intercept defaults to be applied: %+v", applied.Intercept)
+	}
+	if applied.Cache.Directory == "" || applied.Cache.TTL == 0 {
+		t.Fatalf("expected cache defaults to be applied: %+v", applied.Cache)
 	}
 }
 

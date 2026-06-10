@@ -223,7 +223,7 @@ func (s *Server) startEventRecorder() {
 	if s.options.Store == nil || s.options.EventBus == nil {
 		return
 	}
-	ch := s.options.EventBus.Subscribe("*")
+	ch, _ := s.options.EventBus.Subscribe("*")
 	go func() {
 		for event := range ch {
 			if err := s.options.Store.RecordEvent(context.Background(), event); err != nil {
@@ -530,20 +530,12 @@ func (s *Server) loadPentestTrafficDetails(ctx context.Context, scopeID string, 
 	const pageSize = 500
 	var details []store.TrafficDetail
 	for offset := 0; ; offset += pageSize {
-		flows, err := s.options.Store.ListTrafficScopedPage(ctx, pageSize, offset, scopeID, includeOutOfScope, "")
+		page, err := s.options.Store.ListTrafficDetailsScopedPage(ctx, pageSize, offset, scopeID, includeOutOfScope, "")
 		if err != nil {
 			return nil, err
 		}
-		for _, flow := range flows {
-			detail, ok, err := s.options.Store.GetTrafficDetail(ctx, flow.ID)
-			if err != nil {
-				return nil, err
-			}
-			if ok {
-				details = append(details, detail)
-			}
-		}
-		if len(flows) < pageSize {
+		details = append(details, page...)
+		if len(page) < pageSize {
 			break
 		}
 	}
@@ -2111,7 +2103,8 @@ func (s *Server) handleTrafficStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch := s.options.EventBus.Subscribe("*")
+	ch, cancel := s.options.EventBus.Subscribe("*")
+	defer cancel()
 	for {
 		select {
 		case event := <-ch:
@@ -2823,15 +2816,7 @@ func (s *Server) handleSettings(w http.ResponseWriter, r *http.Request) {
 				cfg.Cache.TTL = *input.Cache.TTL
 			}
 		}
-		if err := cfg.ValidateUpstreamProxy(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := cfg.ValidateProxyAuth(); err != nil {
-			http.Error(w, err.Error(), http.StatusBadRequest)
-			return
-		}
-		if err := cfg.ValidateIntercept(); err != nil {
+		if err := cfg.NormalizeAndValidate(); err != nil {
 			http.Error(w, err.Error(), http.StatusBadRequest)
 			return
 		}
@@ -3438,7 +3423,8 @@ func (s *Server) handleThreatStream(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	ch := s.options.ThreatScanner.Subscribe()
+	ch, cancel := s.options.ThreatScanner.Subscribe()
+	defer cancel()
 	fmt.Fprintf(w, "event: ready\ndata: {}\n\n")
 	flusher.Flush()
 	for {

@@ -321,7 +321,9 @@ func Load(path string) (*Config, error) {
 			path = "config.json"
 		} else {
 			log.Println("No config file specified or found, using defaults")
-
+			if err := cfg.NormalizeAndValidate(); err != nil {
+				return nil, err
+			}
 			return cfg, nil
 		}
 	}
@@ -336,70 +338,84 @@ func Load(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse config file: %w", err)
 	}
 
-	// If nested cache object is not populated but legacy fields are present, migrate them
-	if isZeroCache(cfg.Cache) && hasAnyLegacyCache(*cfg) {
-		migrateLegacyToCache(cfg)
-	}
-
-	// Fill defaults for cache if missing
-	if cfg.Cache.Directory == "" {
-		cfg.Cache.Directory = "cache"
-	}
-
-	if cfg.Cache.TTL == 0 {
-		cfg.Cache.TTL = 3600
-	}
-
-	applyThreatScannerDefaults(&cfg.ThreatScanner)
-	applyAICopilotDefaults(&cfg.AICopilot, cfg.ThreatScanner)
-	applyUpstreamProxyDefaults(&cfg.UpstreamProxy)
-	applyProxyAuthDefaults(&cfg.ProxyAuth)
-	applyTrafficCaptureDefaults(&cfg.TrafficCapture)
-	applyInterceptDefaults(&cfg.Intercept)
-
-	if strings.TrimSpace(cfg.AdminAddr) == "" {
-		cfg.AdminAddr = "127.0.0.1:9090"
-	}
-
-	if strings.TrimSpace(cfg.AdminStore) == "" {
-		cfg.AdminStore = "dashboard.db"
-	}
-
-	if cfg.BlockAction == "" {
-		cfg.BlockAction = "deny"
-	}
-
-	if cfg.BlockResponseStatus == 0 {
-		cfg.BlockResponseStatus = 403
-	}
-
-	// Default proxy name if missing
-	if strings.TrimSpace(cfg.ProxyName) == "" {
-		cfg.ProxyName = "MITM-Proxy"
-	}
-
-	// Validate mutual exclusivity for include/exclude settings (nested cache)
-	if len(cfg.Cache.IncludeDomains) > 0 && len(cfg.Cache.ExcludeDomains) > 0 {
-		return nil, fmt.Errorf("invalid config: cache.include_domains and cache.exclude_domains cannot both be set")
-	}
-
-	if len(cfg.Cache.IncludeExtensions) > 0 && len(cfg.Cache.ExcludeExtensions) > 0 {
-		return nil, fmt.Errorf("invalid config: cache.include_extensions and cache.exclude_extensions cannot both be set")
-	}
-
-	if err := cfg.ValidateUpstreamProxy(); err != nil {
-		return nil, err
-	}
-	if err := cfg.ValidateProxyAuth(); err != nil {
-		return nil, err
-	}
-	if err := cfg.ValidateIntercept(); err != nil {
+	if err := cfg.NormalizeAndValidate(); err != nil {
 		return nil, err
 	}
 
 	log.Printf("Loaded configuration from %s", path)
 
 	return cfg, nil
+}
+
+// NormalizeAndValidate applies runtime defaults, migrates legacy fields, and
+// rejects invalid combinations in one shared path for file and admin updates.
+func (c *Config) NormalizeAndValidate() error {
+	if c == nil {
+		return fmt.Errorf("invalid config: config is nil")
+	}
+
+	// If nested cache object is not populated but legacy fields are present, migrate them
+	if isZeroCache(c.Cache) && hasAnyLegacyCache(*c) {
+		migrateLegacyToCache(c)
+	}
+
+	// Fill defaults for cache if missing
+	if c.Cache.Directory == "" {
+		c.Cache.Directory = "cache"
+	}
+
+	if c.Cache.TTL == 0 {
+		c.Cache.TTL = 3600
+	}
+
+	applyThreatScannerDefaults(&c.ThreatScanner)
+	applyAICopilotDefaults(&c.AICopilot, c.ThreatScanner)
+	applyUpstreamProxyDefaults(&c.UpstreamProxy)
+	applyProxyAuthDefaults(&c.ProxyAuth)
+	applyTrafficCaptureDefaults(&c.TrafficCapture)
+	applyInterceptDefaults(&c.Intercept)
+
+	if strings.TrimSpace(c.AdminAddr) == "" {
+		c.AdminAddr = "127.0.0.1:9090"
+	}
+
+	if strings.TrimSpace(c.AdminStore) == "" {
+		c.AdminStore = "dashboard.db"
+	}
+
+	if c.BlockAction == "" {
+		c.BlockAction = "deny"
+	}
+
+	if c.BlockResponseStatus == 0 {
+		c.BlockResponseStatus = 403
+	}
+
+	// Default proxy name if missing
+	if strings.TrimSpace(c.ProxyName) == "" {
+		c.ProxyName = "MITM-Proxy"
+	}
+
+	// Validate mutual exclusivity for include/exclude settings (nested cache)
+	if len(c.Cache.IncludeDomains) > 0 && len(c.Cache.ExcludeDomains) > 0 {
+		return fmt.Errorf("invalid config: cache.include_domains and cache.exclude_domains cannot both be set")
+	}
+
+	if len(c.Cache.IncludeExtensions) > 0 && len(c.Cache.ExcludeExtensions) > 0 {
+		return fmt.Errorf("invalid config: cache.include_extensions and cache.exclude_extensions cannot both be set")
+	}
+
+	if err := c.ValidateUpstreamProxy(); err != nil {
+		return err
+	}
+	if err := c.ValidateProxyAuth(); err != nil {
+		return err
+	}
+	if err := c.ValidateIntercept(); err != nil {
+		return err
+	}
+
+	return nil
 }
 
 func applyInterceptDefaults(c *InterceptConfig) {

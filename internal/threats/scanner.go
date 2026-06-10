@@ -547,12 +547,30 @@ func (m *Manager) OverrideEvent(id, action string) (Event, bool) {
 	return Event{}, false
 }
 
-func (m *Manager) Subscribe() <-chan Event {
+func (m *Manager) Subscribe() (<-chan Event, func()) {
 	ch := make(chan Event, 32)
+	cancelled := false
 	m.mu.Lock()
 	m.subscribers = append(m.subscribers, ch)
 	m.mu.Unlock()
-	return ch
+
+	cancel := func() {
+		m.mu.Lock()
+		defer m.mu.Unlock()
+		if cancelled {
+			return
+		}
+		cancelled = true
+		for i, subscriber := range m.subscribers {
+			if subscriber == ch {
+				copy(m.subscribers[i:], m.subscribers[i+1:])
+				m.subscribers = m.subscribers[:len(m.subscribers)-1]
+				break
+			}
+		}
+	}
+
+	return ch, cancel
 }
 
 func (m *Manager) Test(ctx context.Context, input ScanInput) (ThreatVerdict, error) {

@@ -105,14 +105,26 @@ function adminPathForView(view) {
   const slug = VIEW_SLUGS[view] || "";
   const params = new URLSearchParams(location.search);
   params.delete("view");
+  params.delete("token");
   const query = params.toString();
   const path = slug ? `/admin/${slug}` : "/admin/";
   return query ? `${path}?${query}` : path;
 }
 
+function stripTokenFromURL() {
+  const url = new URL(window.location.href);
+  if (!url.searchParams.has("token")) return;
+  url.searchParams.delete("token");
+  const query = url.searchParams.toString();
+  history.replaceState(history.state, "", `${url.pathname}${query ? `?${query}` : ""}${url.hash}`);
+}
+
 function getToken() {
-  const value = new URLSearchParams(location.search).get("token") || localStorage.getItem("adminToken") || "";
+  const params = new URLSearchParams(location.search);
+  const urlToken = params.get("token") || "";
+  const value = urlToken || localStorage.getItem("adminToken") || "";
   if (value) localStorage.setItem("adminToken", value);
+  if (urlToken) stripTokenFromURL();
   return value;
 }
 
@@ -245,6 +257,7 @@ function App() {
   }, []);
 
   useEffect(() => {
+    getToken();
     const nextPath = adminPathForView(current);
     const currentPath = `${location.pathname}${location.search}`;
     if (nextPath !== currentPath) {
@@ -343,27 +356,71 @@ function PageState({ state }) {
 
 function DashboardView({ refreshKey, setStatus, setCurrent }) {
   const [restartState, setRestartState] = useState({ status: "idle", message: "" });
+  const [liveKey, setLiveKey] = useState(0);
+  const liveTimerRef = useRef(null);
   const state = useAsync(async () => {
-    const [health, version, trafficStats, recentTraffic, audit, threats, cache] = await Promise.all([
+    const [health, version, trafficStats, recentTraffic, audit, threats, cache, timeline] = await Promise.all([
       api("/api/health"),
       api("/api/version"),
       api("/api/traffic/stats"),
-      api("/api/traffic?limit=5"),
+      api("/api/traffic?limit=40"),
       api("/api/audit"),
       api("/api/threats/events"),
       api("/api/cache?limit=1"),
+      api("/api/timeline?limit=40"),
     ]);
-    return { health, version, trafficStats, recentTraffic, audit, threats, cache };
-  }, [refreshKey]);
+    return { health, version, trafficStats, recentTraffic, audit, threats, cache, timeline };
+  }, [refreshKey, liveKey]);
+
+  useEffect(() => {
+    const source = new EventSource(`/api/traffic/stream?token=${encodeURIComponent(getToken())}`);
+    const scheduleRefresh = () => {
+      if (liveTimerRef.current) return;
+      liveTimerRef.current = setTimeout(() => {
+        liveTimerRef.current = null;
+        setLiveKey((value) => value + 1);
+      }, 650);
+    };
+    [
+      "traffic.request.started",
+      "traffic.response.completed",
+      "traffic.tunnel.opened",
+      "traffic.blocked",
+      "cache.hit",
+      "cache.miss",
+      "fault.injected",
+      "intercept.pending",
+      "intercept.resolved",
+      "websocket.connection",
+      "websocket.frame",
+      "config.updated",
+      "host_profile.matched",
+    ].forEach((topic) => source.addEventListener(topic, scheduleRefresh));
+    source.onerror = () => source.close();
+    return () => {
+      source.close();
+      if (liveTimerRef.current) {
+        clearTimeout(liveTimerRef.current);
+        liveTimerRef.current = null;
+      }
+    };
+  }, []);
 
   useEffect(() => {
     if (state.data?.health?.status) setStatus(state.data.health.status);
   }, [state.data, setStatus]);
 
   if (state.loading || state.error) return <PageState state={state} />;
-  const { health, version, trafficStats, recentTraffic, audit, threats, cache } = state.data;
+  const { health, version, trafficStats, recentTraffic, audit, threats, cache, timeline } = state.data;
   const totalTraffic = Number(trafficStats.total || 0);
   const cacheHits = Number(trafficStats.cache_hit || cache?.hits || 0);
+  const blockedTraffic = Number(trafficStats.blocked || threats.metrics?.blocked_threats || 0);
+  const recentFlows = recentTraffic || [];
+  const timelineEntries = timeline || [];
+  const recentStatusBuckets = statusBuckets(recentFlows);
+  const methodBuckets = methodBucketsFromFlows(recentFlows);
+  const timelineBuckets = timelineKindBuckets(timelineEntries);
+  const latencySeries = recentFlows.slice().reverse().map((flow) => Number(flow.duration_ms || 0)).filter((value) => value >= 0);
   const uptime = formatDuration(Number(health.uptime_seconds || 0));
   const reloadConfig = async () => {
     await post("/api/deployments/current/reload");
@@ -398,14 +455,28 @@ function DashboardView({ refreshKey, setStatus, setCurrent }) {
       </div>
       <div className="grid metrics-grid">
         <Metric label="Requests captured" value={totalTraffic} />
-        <Metric label="Threats blocked" value={threats.metrics?.blocked_threats || trafficStats.blocked || 0} />
+        <Metric label="Threats blocked" value={blockedTraffic} />
         <Metric label="Cache hit rate" value={`${cacheHits} / ${totalTraffic}`} />
         <Metric label="Uptime" value={uptime} hint="hh:mm" />
+      </div>
+      <div className="dashboard-charts">
+        <ChartPanel title="Traffic Mix" subtitle="Recent HTTP statuses">
+          <DonutChart segments={recentStatusBuckets} centerLabel={`${recentFlows.length}`} centerSub="recent" />
+        </ChartPanel>
+        <ChartPanel title="Methods" subtitle="Recent request methods">
+          <BarList data={methodBuckets} />
+        </ChartPanel>
+        <ChartPanel title="Timeline Events" subtitle="Last 40 persisted events">
+          <BarList data={timelineBuckets} />
+        </ChartPanel>
+        <ChartPanel title="Latency" subtitle="Recent response durations">
+          <Sparkline values={latencySeries} />
+        </ChartPanel>
       </div>
       {restartState.message && <div className={`restart-feedback ${restartState.status}`}>{restartState.message}</div>}
       <div className="dashboard-panels">
         <SummaryPanel title="Recent traffic" action={<button className="rowbutton" onClick={() => setCurrent("Traffic")}>View all</button>}>
-          <TrafficSummaryList flows={recentTraffic || []} />
+          <TrafficSummaryList flows={recentFlows.slice(0, 5)} />
         </SummaryPanel>
         <SummaryPanel title="Audit log" action={<button className="rowbutton" onClick={() => setCurrent("Audit Log")}>Open</button>}>
           <AuditSummaryList entries={(audit || []).slice(0, 4)} />
@@ -461,6 +532,116 @@ function AuditSummaryList({ entries }) {
       </tbody>
     </table>
   );
+}
+
+function ChartPanel({ title, subtitle, children }) {
+  return (
+    <div className="panel chart-panel">
+      <div className="chart-head">
+        <h2>{title}</h2>
+        <span>{subtitle}</span>
+      </div>
+      {children}
+    </div>
+  );
+}
+
+function DonutChart({ segments, centerLabel, centerSub }) {
+  const total = segments.reduce((sum, item) => sum + item.value, 0);
+  let offset = 0;
+  const radius = 42;
+  const circumference = 2 * Math.PI * radius;
+  return (
+    <div className="donut-wrap">
+      <svg className="donut-chart" viewBox="0 0 120 120" role="img" aria-label="Traffic mix chart">
+        <circle className="donut-track" cx="60" cy="60" r={radius} />
+        {total > 0 && segments.map((segment) => {
+          const length = (segment.value / total) * circumference;
+          const currentOffset = offset;
+          offset += length;
+          return <circle key={segment.label} className={`donut-segment ${segment.tone || ""}`} cx="60" cy="60" r={radius} strokeDasharray={`${length} ${circumference - length}`} strokeDashoffset={-currentOffset} />;
+        })}
+        <text x="60" y="57" textAnchor="middle" className="donut-center">{centerLabel}</text>
+        <text x="60" y="73" textAnchor="middle" className="donut-sub">{centerSub}</text>
+      </svg>
+      <div className="chart-legend">
+        {segments.map((segment) => <div key={segment.label}><span className={`legend-dot ${segment.tone || ""}`} />{segment.label}<strong>{segment.value}</strong></div>)}
+      </div>
+    </div>
+  );
+}
+
+function BarList({ data }) {
+  const max = Math.max(1, ...data.map((item) => item.value));
+  if (!data.length) return <div className="empty-list">No data yet.</div>;
+  return (
+    <div className="bar-list">
+      {data.map((item) => (
+        <div className="bar-row" key={item.label}>
+          <div className="bar-label"><span>{item.label}</span><strong>{item.value}</strong></div>
+          <div className="bar-track"><div className={`bar-fill ${item.tone || ""}`} style={{ width: `${Math.max(6, (item.value / max) * 100)}%` }} /></div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Sparkline({ values }) {
+  const width = 280;
+  const height = 104;
+  const clean = values.length ? values : [0];
+  const max = Math.max(1, ...clean);
+  const points = clean.map((value, index) => {
+    const x = clean.length === 1 ? width / 2 : (index / (clean.length - 1)) * width;
+    const y = height - (value / max) * (height - 18) - 9;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+  const latest = values.length ? values[values.length - 1] : 0;
+  return (
+    <div className="sparkline-wrap">
+      <svg className="sparkline" viewBox={`0 0 ${width} ${height}`} preserveAspectRatio="none" role="img" aria-label="Latency sparkline">
+        <polyline points={points} />
+      </svg>
+      <div className="sparkline-meta"><strong>{latest} ms</strong><span>latest</span><span>max {Math.max(0, ...values)} ms</span></div>
+    </div>
+  );
+}
+
+function statusBuckets(flows) {
+  const buckets = [
+    { label: "2xx", value: 0, tone: "ok" },
+    { label: "3xx", value: 0, tone: "info" },
+    { label: "4xx", value: 0, tone: "warn" },
+    { label: "5xx", value: 0, tone: "danger" },
+    { label: "Other", value: 0, tone: "" },
+  ];
+  for (const flow of flows || []) {
+    const status = Number(flow.status || 0);
+    if (status >= 200 && status < 300) buckets[0].value += 1;
+    else if (status >= 300 && status < 400) buckets[1].value += 1;
+    else if (status >= 400 && status < 500) buckets[2].value += 1;
+    else if (status >= 500) buckets[3].value += 1;
+    else buckets[4].value += 1;
+  }
+  return buckets.filter((bucket) => bucket.value > 0);
+}
+
+function methodBucketsFromFlows(flows) {
+  const counts = new Map();
+  for (const flow of flows || []) {
+    const method = String(flow.method || "REQ").toUpperCase();
+    counts.set(method, (counts.get(method) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 5).map(([label, value]) => ({ label, value, tone: METHOD_CLASS[label] || "" }));
+}
+
+function timelineKindBuckets(entries) {
+  const counts = new Map();
+  for (const entry of entries || []) {
+    const kind = String(entry.kind || "event");
+    counts.set(kind, (counts.get(kind) || 0) + 1);
+  }
+  return [...counts.entries()].sort((a, b) => b[1] - a[1]).slice(0, 6).map(([label, value]) => ({ label, value, tone: label }));
 }
 
 function statusCodeClass(status) {

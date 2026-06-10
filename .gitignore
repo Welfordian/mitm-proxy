@@ -1,6 +1,8 @@
 .idea
+.DS_Store
 ca-cert.pem
 ca-key.pem
+/mitm-proxy
 *.exe
 dashboard.db
 dashboard.db-*
